@@ -1,0 +1,86 @@
+#!/usr/bin/env node
+/**
+ * build-exe.js
+ *
+ * Produces standalone Windows executables using Node.js SEA
+ * (Single Executable Applications, built into Node >=20).
+ *
+ * Steps for each binary:
+ *   1. esbuild: bundle ESM → CJS (all local imports inlined, node: builtins kept external)
+ *   2. node --experimental-sea-config: compile bundle into a .blob
+ *   3. Copy node.exe → <name>.exe
+ *   4. postject: inject the blob into the exe
+ *
+ * Output: dist/exe/  dsw.exe  d.exe  dsd.exe  dswait.exe
+ */
+
+import { execSync } from "node:child_process";
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const ROOT = dirname(fileURLToPath(import.meta.url));
+const DIST = resolve(ROOT, "dist", "exe");
+mkdirSync(DIST, { recursive: true });
+
+const FUSE = "NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2";
+const NODE_EXE = process.execPath;
+
+// Embed the default system prompt so the exe doesn't need the prompts/ dir at runtime.
+const systemPrompt = readFileSync(resolve(ROOT, "prompts", "default-system.md"), "utf8");
+const DEFINE_SYSTEM_PROMPT = `__SYSTEM_PROMPT__=${JSON.stringify(systemPrompt)}`;
+
+const ENTRIES = [
+  { name: "dsw",    src: "src/deepseek-watch.js" },
+  { name: "dsd",    src: "src/deepseek-detached.js" },
+  { name: "dswait", src: "src/wait-for-file.js" },
+];
+
+function run(cmd, label) {
+  process.stdout.write(`  ▸ ${label}\n`);
+  execSync(cmd, { stdio: "inherit", cwd: ROOT });
+}
+
+for (const { name, src } of ENTRIES) {
+  process.stdout.write(`\n◆ ${name}\n`);
+
+  const cjs    = resolve(DIST, `${name}.cjs`);
+  const blob   = resolve(DIST, `${name}.blob`);
+  const config = resolve(DIST, `${name}-sea.json`);
+  const exe    = resolve(DIST, `${name}.exe`);
+
+  // 1. Bundle
+  run(
+    `npx esbuild "${resolve(ROOT, src)}" --bundle --platform=node --format=cjs` +
+    ` --external:"node:*" --define:${DEFINE_SYSTEM_PROMPT} --outfile="${cjs}"`,
+    "bundle"
+  );
+
+  // 2. SEA config + blob
+  writeFileSync(config, JSON.stringify({
+    main: cjs,
+    output: blob,
+    disableExperimentalSEAWarning: true,
+    useSnapshot: false,
+    useCodeCache: true
+  }));
+  run(`node --experimental-sea-config "${config}"`, "sea-config");
+
+  // 3. Copy node.exe as the base
+  copyFileSync(NODE_EXE, exe);
+
+  // 4. Inject blob
+  run(
+    `npx postject "${exe}" NODE_SEA_BLOB "${blob}"` +
+    ` --sentinel-fuse ${FUSE} --overwrite`,
+    "postject"
+  );
+
+  process.stdout.write(`  ✓ ${name}.exe\n`);
+}
+
+// d.exe is a copy of dsw.exe (alias)
+copyFileSync(resolve(DIST, "dsw.exe"), resolve(DIST, "d.exe"));
+process.stdout.write("\n  ✓ d.exe  (alias for dsw)\n");
+
+process.stdout.write(`\nOutput: ${DIST}\n`);

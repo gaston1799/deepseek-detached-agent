@@ -11,7 +11,10 @@ import { listSessions, newSession, newSessionPath, readSession, sessionPath, tou
 
 const DEFAULT_BASE_URL = "https://api.deepseek.com";
 const DEFAULT_MODEL = "deepseek-v4-flash";
-const DEFAULT_SYSTEM_PROMPT = new URL("../prompts/default-system.md", import.meta.url);
+const DEFAULT_SYSTEM_PROMPT_FILE = new URL("../prompts/default-system.md", import.meta.url);
+// __SYSTEM_PROMPT__ is replaced with the file's content by the exe build step (esbuild --define).
+// In normal dev/npm installs it is undefined and the file is read at runtime instead.
+const EMBEDDED_SYSTEM_PROMPT = typeof __SYSTEM_PROMPT__ !== "undefined" ? __SYSTEM_PROMPT__ : null;
 
 function usage() {
   return `dsw  (alias: d)
@@ -165,8 +168,14 @@ function runtimeContext() {
 
 async function loadSystemPrompt(opts) {
   if (opts.system) return opts.system.replace("{{context}}", runtimeContext());
-  const file = opts.systemFile ? resolve(opts.systemFile) : DEFAULT_SYSTEM_PROMPT;
-  const template = await readFile(file, "utf8");
+  let template;
+  if (opts.systemFile) {
+    template = await readFile(resolve(opts.systemFile), "utf8");
+  } else if (EMBEDDED_SYSTEM_PROMPT) {
+    template = EMBEDDED_SYSTEM_PROMPT;
+  } else {
+    template = await readFile(DEFAULT_SYSTEM_PROMPT_FILE, "utf8");
+  }
   return template.replace("{{context}}", runtimeContext());
 }
 

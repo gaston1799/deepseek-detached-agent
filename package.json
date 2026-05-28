@@ -11,7 +11,12 @@
   },
   "scripts": {
     "check": "node --check src/api-error.js && node --check src/config.js && node --check src/deepseek-request.js && node --check src/session-memory.js && node --check src/deepseek-watch.js && node --check src/deepseek-detached.js && node --check src/wait-for-file.js",
-    "smoke": "node src/deepseek-watch.js --help && node src/deepseek-detached.js --help && node src/wait-for-file.js --help"
+    "smoke": "node src/deepseek-watch.js --help && node src/deepseek-detached.js --help && node src/wait-for-file.js --help",
+    "build:exe": "node build-exe.js"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "postject": "^1.0.0-alpha.6"
   },
   "keywords": [
     "deepseek",
@@ -22,6 +27,6 @@
   ],
   "license": "MIT",
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   }
 }

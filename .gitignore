@@ -4,4 +4,5 @@ node_modules/
 *.log
 out/
 tmp/
+dist/
 .deepseek-watch/

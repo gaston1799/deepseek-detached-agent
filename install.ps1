@@ -105,17 +105,17 @@ Write-Ok "winget found."
 
 # ── Node.js ──────────────────────────────────────────────────────────────────
 
-Write-Step "Checking Node.js >= 18..."
+Write-Step "Checking Node.js >= 20 (required for standalone exe build)..."
 $nodeMajor = Get-NodeMajor
-if ($nodeMajor -ge 18) {
+if ($nodeMajor -ge 20) {
   Write-Ok "Node.js v$nodeMajor found — $(& node --version)."
 } else {
   if ($nodeMajor -gt 0) {
-    Write-Warn "Node.js v$nodeMajor is too old (need >= 18). Upgrading..."
+    Write-Warn "Node.js v$nodeMajor is too old (need >= 20). Upgrading..."
   }
   Invoke-Winget-Install "OpenJS.NodeJS.LTS" "Node.js LTS"
   $nodeMajor = Get-NodeMajor
-  if ($nodeMajor -lt 18) {
+  if ($nodeMajor -lt 20) {
     Write-Fail "Node.js install failed. Install manually from https://nodejs.org then re-run."
   }
   Write-Ok "Node.js $(& node --version) installed."
@@ -158,24 +158,57 @@ if (Test-Path (Join-Path (Get-Location) ".git")) {
 
 Set-Location $repoDir
 
-# ── global install ────────────────────────────────────────────────────────────
+# ── install dev dependencies (esbuild, postject) ──────────────────────────────
 
-Write-Step "Running npm install -g ..."
-& npm install -g .
-if ($LASTEXITCODE -ne 0) { Write-Fail "npm install -g failed." }
-Invoke-Refresh-Path
+Write-Step "Installing build dependencies..."
+& npm install
+if ($LASTEXITCODE -ne 0) { Write-Fail "npm install failed." }
+
+# ── build standalone exes ─────────────────────────────────────────────────────
+
+Write-Step "Building standalone executables (esbuild + Node SEA)..."
+& node build-exe.js
+if ($LASTEXITCODE -ne 0) { Write-Fail "exe build failed." }
+
+# ── install exes to Programs dir and add to PATH ──────────────────────────────
+
+$ExeDir = Join-Path $env:LOCALAPPDATA "Programs\dsw"
+Write-Step "Copying executables to $ExeDir..."
+New-Item -ItemType Directory -Force -Path $ExeDir | Out-Null
+
+$aliases = @("dsw", "d", "dsd", "dswait")
+foreach ($alias in $aliases) {
+  $src  = Join-Path $repoDir "dist\exe\$alias.exe"
+  $dest = Join-Path $ExeDir  "$alias.exe"
+  if (Test-Path $src) {
+    Copy-Item $src $dest -Force
+    Write-Ok "$alias.exe"
+  } else {
+    Write-Warn "$alias.exe not found in dist\exe — skipping."
+  }
+}
+
+# Add ExeDir to the user PATH (persistent, via registry)
+Write-Step "Updating user PATH..."
+$userPath = [System.Environment]::GetEnvironmentVariable("PATH", "User")
+if ($userPath -notlike "*$ExeDir*") {
+  $newPath = if ($userPath) { "$userPath;$ExeDir" } else { $ExeDir }
+  [System.Environment]::SetEnvironmentVariable("PATH", $newPath, "User")
+  $env:PATH = "$env:PATH;$ExeDir"
+  Write-Ok "Added $ExeDir to user PATH."
+} else {
+  Write-Ok "$ExeDir already on PATH."
+  $env:PATH = "$env:PATH;$ExeDir"   # refresh current session anyway
+}
 
 # ── verify ────────────────────────────────────────────────────────────────────
 
 Write-Host ""
 if (Test-Command "dsw") {
-  Write-Ok "dsw is on PATH.  Run: dsw --help"
-  Write-Ok "'d' short alias is also available."
+  Write-Ok "dsw.exe is on PATH and working."
+  Write-Ok "Also available: d  dsd  dswait"
 } else {
-  Write-Warn "dsw not found on PATH yet."
-  $npmBin = & npm bin -g 2>$null
-  Write-Warn "npm global bin: $npmBin"
-  Write-Warn "Add it to your PATH or restart your terminal, then run: dsw --help"
+  Write-Warn "dsw not found yet — open a new terminal window and try: dsw --help"
 }
 
 Write-Host ""
