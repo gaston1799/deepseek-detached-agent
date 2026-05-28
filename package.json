@@ -1,0 +1,27 @@
+{
+  "name": "deepseek-detached-agent",
+  "version": "0.1.0",
+  "description": "Run DeepSeek as a detached subagent, write the final answer to Markdown, and fall back to Claude CLI.",
+  "type": "module",
+  "bin": {
+    "dsw": "./src/deepseek-watch.js",
+    "d": "./src/deepseek-watch.js",
+    "dsd": "./src/deepseek-detached.js",
+    "dswait": "./src/wait-for-file.js"
+  },
+  "scripts": {
+    "check": "node --check src/api-error.js && node --check src/config.js && node --check src/deepseek-request.js && node --check src/session-memory.js && node --check src/deepseek-watch.js && node --check src/deepseek-detached.js && node --check src/wait-for-file.js",
+    "smoke": "node src/deepseek-watch.js --help && node src/deepseek-detached.js --help && node src/wait-for-file.js --help"
+  },
+  "keywords": [
+    "deepseek",
+    "claude",
+    "subagent",
+    "detached",
+    "codex"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
+}
