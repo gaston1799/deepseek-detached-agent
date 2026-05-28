@@ -138,11 +138,23 @@ DeepSeek sends the exact text to replace and its replacement. In `ask` mode you 
   --session <file>                 Session JSON file
   --resume                         Resume from --session or pick from list
   --no-save-session                Don't persist session to disk
+  -o, --output <file>              Write a Markdown result file
+  --outfile <file>                 Alias for --output
+  --no-output                      Suppress terminal output; requires --output/--outfile
+  --full-chat                      Write full transcript instead of final answer + touched files
   --dangerously-auto-run-commands  Auto-approve all commands and file writes
   --no-tools                       Disable all workspace tools
   --no-color                       Disable ANSI colors
   -h, --help                       Show help
 ```
+
+Quiet outfile mode is meant for detached subagent workflows where console text costs tokens:
+
+```bash
+dsw -p "inspect this repo and write findings" --permission full --no-output --outfile result.md
+```
+
+By default the Markdown file contains only the final assistant response and files touched by edit tools. Add `--full-chat` when you want the whole conversation, tool calls, tool results, and reasoning transcript written to the outfile.
 
 ---
 

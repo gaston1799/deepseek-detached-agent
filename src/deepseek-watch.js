@@ -49,6 +49,10 @@ Options:
   --session <file>             Session memory JSON file. Default: new timestamped session.
   --resume                     Resume from --session, or pick a recent session if omitted.
   --no-save-session            Do not write session memory to disk.
+  -o, --output <file>          Write a Markdown result file.
+  --outfile <file>             Alias for --output.
+  --no-output                  Suppress terminal output. Requires --output/--outfile.
+  --full-chat                  Output the full chat transcript instead of final answer + touched files.
   --dangerously-auto-run-commands
                                Run requested cmd/PowerShell commands without prompting.
   --no-tools                   Disable built-in read-only workspace tools.
@@ -71,6 +75,9 @@ function parseArgs(argv) {
     session: null,
     explicitSession: false,
     saveSession: true,
+    output: null,
+    noOutput: false,
+    fullChat: false,
     resume: false,
     dangerouslyAutoRunCommands: false,
     tools: true,
@@ -107,6 +114,9 @@ function parseArgs(argv) {
     }
     else if (arg === "--resume") opts.resume = true;
     else if (arg === "--no-save-session") opts.saveSession = false;
+    else if (arg === "-o" || arg === "--output" || arg === "--outfile") opts.output = next();
+    else if (arg === "--no-output") opts.noOutput = true;
+    else if (arg === "--full-chat") opts.fullChat = true;
     else if (arg === "--dangerously-auto-run-commands") opts.dangerouslyAutoRunCommands = true;
     else if (arg === "--no-tools") opts.tools = false;
     else if (arg === "--no-color") opts.color = false;
@@ -126,6 +136,8 @@ function validateOpts(opts) {
   if (!["parallel", "sequential"].includes(opts.toolMode)) throw new Error("--tool-mode must be parallel or sequential.");
   if (opts.permission && !["review", "ask", "full"].includes(opts.permission)) throw new Error("--permission must be review, ask, or full.");
   if (opts.resume && !opts.saveSession) throw new Error("--resume cannot be combined with --no-save-session.");
+  if (opts.noOutput && !opts.output) throw new Error("--no-output requires --output <file> or --outfile <file>.");
+  if (opts.fullChat && !opts.output) throw new Error("--full-chat requires --output <file> or --outfile <file>.");
 }
 
 function readStdin() {
@@ -221,6 +233,7 @@ function label(opts, icon, text, code = "1;36") {
 }
 
 function heading(opts, text, kind = "info") {
+  if (opts.noOutput) return;
   const styles = {
     thinking: ["2;36", ICONS.thinking],
     final: ["1;32", ICONS.final],
@@ -236,6 +249,7 @@ function heading(opts, text, kind = "info") {
 }
 
 function writeSessionNotice(opts, path) {
+  if (opts.noOutput) return;
   process.stderr.write(`  ${color(opts, "2;35", `${ICONS.session} session`)}  ${dim(opts, path)}\n`);
 }
 
@@ -248,11 +262,13 @@ function formatJsonish(raw) {
 }
 
 function writeToolCall(opts, name, rawArgs) {
+  if (opts.noOutput) return;
   process.stdout.write(`  ${yellow(opts, "▹")} ${bold(opts, name)}\n`);
   process.stdout.write(`${dim(opts, formatJsonish(rawArgs)).split("\n").map((line) => `    ${line}`).join("\n")}\n`);
 }
 
 function writeToolResult(opts, result) {
+  if (opts.noOutput) return;
   const text = String(result);
   const display = text.length > 4000 ? `${text.slice(0, 4000)}\n  …` : text;
   const isError = text === "blocked by user" || text.startsWith("Tool error:") || text.startsWith("command error:");
@@ -272,6 +288,58 @@ function readTextFileDisplay(args, result) {
 function toolDisplayResult(name, args, result) {
   if (name === "read_text_file") return readTextFileDisplay(args, result);
   return result;
+}
+
+function compactText(value, max = 900) {
+  const text = String(value || "").replace(/\r\n/g, "\n").trim();
+  if (text.length <= max) return text;
+  return `${text.slice(0, max).trimEnd()}\n...`;
+}
+
+function historyTitle(message) {
+  if (message.role === "user") return "you";
+  if (message.role === "assistant") return "assistant";
+  if (message.role === "tool") return "tool";
+  return message.role || "message";
+}
+
+function historyBody(message) {
+  if (message.role === "tool") {
+    return compactText(message.content, 500);
+  }
+
+  if (message.tool_calls?.length) {
+    const calls = message.tool_calls
+      .map((call) => call.function?.name || "tool")
+      .join(", ");
+    const content = compactText(message.content, 500);
+    return content ? `${content}\n[tool calls: ${calls}]` : `[tool calls: ${calls}]`;
+  }
+
+  return compactText(message.content, message.role === "assistant" ? 900 : 700);
+}
+
+function renderChatHistory(opts, session, maxMessages = 18) {
+  const messages = (session.messages || [])
+    .filter((message) => message.role !== "system")
+    .slice(-maxMessages);
+
+  process.stdout.write("\x1b[2J\x1b[H");
+  process.stdout.write(`  ${bold(opts, "Session history")}\n`);
+  process.stdout.write(`  ${dim(opts, `permission ${session.config?.permission || "ask"}  -  ${messages.length} shown`)}\n\n`);
+
+  if (messages.length === 0) {
+    process.stdout.write(`  ${dim(opts, "No previous messages.")}\n\n`);
+    return;
+  }
+
+  for (const message of messages) {
+    const title = historyTitle(message);
+    const body = historyBody(message);
+    const colorCode = message.role === "user" ? "1;36" : message.role === "assistant" ? "1;32" : "1;33";
+    process.stdout.write(`  ${color(opts, colorCode, title)}\n`);
+    process.stdout.write(`${dim(opts, body.split("\n").map((line) => `    ${line}`).join("\n"))}\n\n`);
+  }
 }
 
 function sessionLabel(item, index) {
@@ -448,6 +516,8 @@ async function dashboardOpts() {
   if (action === "resume") {
     opts.resume = true;
     opts.session = await pickSession(opts);
+    const session = await readSession(opts.session);
+    renderChatHistory(opts, session);
   } else {
     const permission = await pickPermission(opts);
     if (permission === "quit") {
@@ -632,6 +702,78 @@ async function atomicWriteFile(absPath, content) {
   await rename(tmp, absPath);
 }
 
+async function writeAtomicMarkdown(path, content) {
+  const out = resolve(path);
+  await mkdir(dirname(out), { recursive: true });
+  const tmp = `${out}.tmp-${process.pid}`;
+  await writeFile(tmp, content.endsWith("\n") ? content : `${content}\n`, "utf8");
+  await rename(tmp, out);
+}
+
+function markdownFence(value) {
+  const text = String(value || "");
+  const fence = text.includes("```") ? "````" : "```";
+  return `${fence}\n${text}\n${fence}`;
+}
+
+function finalAssistantContent(session) {
+  const messages = session.messages || [];
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (message.role === "assistant" && typeof message.content === "string" && message.content.trim()) {
+      return message.content.trim();
+    }
+  }
+  return "";
+}
+
+function formatTouchedFiles(session) {
+  const files = [...new Set(session.touchedFiles || [])].sort();
+  if (!files.length) return "- None";
+  return files.map((file) => `- ${file}`).join("\n");
+}
+
+function formatOutputMarkdown(opts, session) {
+  if (opts.fullChat) {
+    const lines = ["# DeepSeek Watch Transcript", ""];
+    for (const message of session.messages || []) {
+      if (message.role === "system") continue;
+      lines.push(`## ${historyTitle(message)}`, "");
+      if (message.reasoning_content) {
+        lines.push("### Thinking", "", message.reasoning_content.trim(), "");
+      }
+      if (message.tool_calls?.length) {
+        lines.push("### Tool Calls", "");
+        for (const call of message.tool_calls) {
+          lines.push(`#### ${call.function?.name || "tool"}`, "", markdownFence(call.function?.arguments || "{}"), "");
+        }
+        lines.push("");
+      }
+      lines.push(message.content ? message.content.trim() : "(empty)", "");
+    }
+    lines.push("## Files Touched", "", formatTouchedFiles(session), "");
+    return lines.join("\n");
+  }
+
+  return [
+    "# DeepSeek Watch Result",
+    "",
+    "## Final Response",
+    "",
+    finalAssistantContent(session) || "(no final response)",
+    "",
+    "## Files Touched",
+    "",
+    formatTouchedFiles(session),
+    ""
+  ].join("\n");
+}
+
+async function maybeWriteOutput(opts, session) {
+  if (!opts.output) return;
+  await writeAtomicMarkdown(opts.output, formatOutputMarkdown(opts, session));
+}
+
 function assertInsideWorkspace(path) {
   const root = resolve(process.cwd());
   const localPath = path === "/" || path === "\\" ? "." : path;
@@ -697,6 +839,7 @@ async function maybeRunShellTool(opts, shellName, command, timeoutMs) {
   if (opts.permission === "review") return "blocked by session permission: review only";
 
   if (opts.permission !== "full" && !opts.dangerouslyAutoRunCommands) {
+    if (opts.noOutput) return "blocked by no-output mode";
     const ok = await askYesNo(`Allow ${shellName} command?\n${command}\n`);
     if (!ok) return "blocked by user";
   }
@@ -752,12 +895,14 @@ async function runTool(opts, name, args) {
     const target = assertInsideWorkspace(args.path);
     if (typeof args.content !== "string") throw new Error("content must be a string.");
     if (opts.permission !== "full" && !opts.dangerouslyAutoRunCommands) {
+      if (opts.noOutput) return "blocked by no-output mode";
       let exists = false;
       try { await stat(target); exists = true; } catch {}
       const ok = await askYesNo(`${exists ? "Overwrite" : "Create"} file: ${args.path}?`);
       if (!ok) return "blocked by user";
     }
     await atomicWriteFile(target, args.content);
+    opts.touchedFiles?.add(args.path);
     return `Wrote ${args.path} (${args.content.length} chars)`;
   }
 
@@ -769,6 +914,7 @@ async function runTool(opts, name, args) {
     const content = await readFile(target, "utf8");
     if (!content.includes(args.old_string)) throw new Error("old_string not found in file.");
     if (opts.permission !== "full" && !opts.dangerouslyAutoRunCommands) {
+      if (opts.noOutput) return "blocked by no-output mode";
       const preview = args.old_string.slice(0, 120);
       const ok = await askYesNo(`Patch ${args.path}?\nReplace: ${preview}${args.old_string.length > 120 ? "…" : ""}`);
       if (!ok) return "blocked by user";
@@ -779,6 +925,7 @@ async function runTool(opts, name, args) {
       : content.replace(args.old_string, args.new_string);
     const count = replaceAll ? content.split(args.old_string).length - 1 : 1;
     await atomicWriteFile(target, newContent);
+    opts.touchedFiles?.add(args.path);
     return `Patched ${args.path} (${count} replacement${count !== 1 ? "s" : ""})`;
   }
 
@@ -900,7 +1047,7 @@ async function streamChat(opts, messages) {
             phase = "thinking";
           }
           reasoningContent += delta.reasoning_content;
-          process.stdout.write(dim(opts, delta.reasoning_content));
+          if (!opts.noOutput) process.stdout.write(dim(opts, delta.reasoning_content));
         }
 
         if (delta.content) {
@@ -909,14 +1056,14 @@ async function streamChat(opts, messages) {
             phase = "final";
           }
           content += delta.content;
-          process.stdout.write(delta.content);
+          if (!opts.noOutput) process.stdout.write(delta.content);
         }
 
         if (delta.tool_calls) mergeToolDelta(toolCalls, delta.tool_calls);
       }
     }
 
-    process.stdout.write("\n");
+    if (!opts.noOutput) process.stdout.write("\n");
     return { role: "assistant", content, reasoning_content: reasoningContent, tool_calls: toolCalls.length ? toolCalls : undefined };
   } catch (error) {
     if (interrupted) {
@@ -953,6 +1100,7 @@ async function processAgentTurns(opts, session) {
       writeToolCall(opts, execution.name, execution.rawArgs);
       writeToolResult(opts, toolDisplayResult(execution.name, execution.args, execution.result));
       session.messages.push({ role: "tool", tool_call_id: execution.call.id, content: String(execution.result) });
+      session.touchedFiles = [...(opts.touchedFiles || [])];
       if (opts.saveSession) await writeSession(opts.session, touchSession(session));
     }
   }
@@ -1018,6 +1166,7 @@ async function run() {
   opts.toolMode = opts.toolMode || session.config?.toolMode || "parallel";
   if (opts.permission === "full") opts.dangerouslyAutoRunCommands = true;
   session.config = { ...(session.config || {}), permission: opts.permission, toolMode: opts.toolMode };
+  opts.touchedFiles = new Set(session.touchedFiles || []);
 
   if (opts.resume) {
     session.messages.push({ role: "user", content: userPrompt });
@@ -1029,6 +1178,9 @@ async function run() {
   }
 
   await processAgentTurns(opts, session);
+  session.touchedFiles = [...opts.touchedFiles];
+  if (opts.saveSession) await writeSession(opts.session, touchSession(session));
+  await maybeWriteOutput(opts, session);
 
   while (opts.interactiveChat) {
     process.stdout.write(`
@@ -1040,6 +1192,9 @@ async function run() {
     session.messages.push({ role: "user", content: nextPrompt });
     if (opts.saveSession) await writeSession(opts.session, touchSession(session));
     await processAgentTurns(opts, session);
+    session.touchedFiles = [...opts.touchedFiles];
+    if (opts.saveSession) await writeSession(opts.session, touchSession(session));
+    await maybeWriteOutput(opts, session);
   }
 }
 
