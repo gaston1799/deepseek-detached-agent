@@ -12,6 +12,7 @@
 
 - **Extended thinking** — streams DeepSeek's reasoning chain live as it works
 - **File tools** — read by line range, write new files, patch existing ones
+- **Web search** — search current external information from the agent loop
 - **Shell tools** — run `cmd.exe` and PowerShell with per-session permission controls
 - **Session memory** — every conversation is saved; resume any previous session
 - **Unlimited tool turns** — no cap on how many tool-call loops it can make
@@ -89,15 +90,48 @@ dsw --permission full   -p "refactor utils.js to use ES modules"
 
 ## Workspace tools
 
-| Tool | Permissions | Description |
-|------|-------------|-------------|
-| `get_runtime_context` | all | OS, shell, Node version, git branch, date |
-| `list_workspace_files` | all | List files and directories |
-| `read_text_file` | all | Read a file by **line range** or byte offset |
-| `write_text_file` | ask, full | Create or overwrite a file |
-| `patch_text_file` | ask, full | Exact search-and-replace in a file |
-| `run_cmd` | ask, full | Run a `cmd.exe` command |
-| `run_powershell` | ask, full | Run a PowerShell command |
+### Read-only (all permission levels)
+
+| Tool | Description |
+|------|-------------|
+| `get_runtime_context` | OS, shell, Node version, git branch, date |
+| `list_workspace_files` | List files/dirs — now supports `recursive`, `glob`, `exclude_glob`, `include_metadata`, pagination |
+| `read_text_file` | Read a file by line range or byte offset; `structured: true` returns cursor JSON |
+| `read_text_files` | Batch-read multiple files in one call; per-file errors don't abort the batch |
+| `view_image` | Read a workspace image and return metadata, dimensions, and a data URL when small enough |
+| `search_code` | Regex/literal search across workspace files with glob filter and context lines |
+| `glob` | Discover paths matching a glob pattern (no shell) |
+| `stat_file` | Size, modification time, type, and binary flag for any path |
+| `path_exists` | Check whether a path exists |
+| `is_text_file` | Sniff whether a file is text or binary |
+| `get_related_files` | Scan import/require/include statements to find referenced files |
+| `tree` | Visual directory tree output |
+| `git_status` | `git status --short --branch` |
+| `git_diff` | Staged or unstaged diff, optionally vs a branch |
+| `git_log` | Commit log (one-line format) |
+| `git_blame` | Line-range blame |
+| `cache_set` / `cache_get` | Session key-value store persisted with saved session files |
+| `list_skills` / `read_skill` | Discover and read local skills from configured skill roots |
+| `create_goal` / `get_goal` / `update_goal` | Persistent session goal state for long-running work |
+| `update_plan` / `get_plan` | Persistent visible plan steps with statuses |
+| `session_health` | Session integrity, progress, touched files, and repair-needs summary |
+| `checkpoint_session` | Append a compact checkpoint to the saved session |
+| `summarize_session` | Compact recent session summary |
+| `handoff_status` / `handoff_wait` | Inspect or wait for delegated handoff output files |
+| `web_search` | Web search via Brave (with `BRAVE_SEARCH_API_KEY`) or DuckDuckGo HTML/Lite |
+| `web_fetch` | Fetch a URL and return readable page text with chunk offsets |
+
+### Write tools (ask, full)
+
+| Tool | Description |
+|------|-------------|
+| `write_text_file` | Create or overwrite a file |
+| `patch_files` | Atomic multi-file patch — all `old_string` values must match before any file is written |
+| `patch_text_file` | Single-file exact search-and-replace |
+| `run_cmd` | Run a `cmd.exe` command |
+| `run_powershell` | Run a PowerShell command |
+| `functions_shell_command` | PowerShell with optional workspace-relative `workdir` |
+| `handoff_start` | Start a bounded delegated CLI handoff with prompt, output, and log files |
 
 ### Reading by line range
 
@@ -109,9 +143,24 @@ read lines 40–80 of src/auth.js
 
 Internally: `read_text_file { "path": "src/auth.js", "start_line": 40, "end_line": 80 }`
 
-### Patching files
+### Searching across files
 
-DeepSeek sends the exact text to replace and its replacement. In `ask` mode you see the preview and confirm before the change is written.
+```
+search_code { "pattern": "TODO", "glob": "**/*.ts", "context_lines": 2 }
+```
+
+### Atomic multi-file patching
+
+`patch_files` preflights all `old_string` values first — if any don't match, no files are written:
+
+```json
+{
+  "edits": [
+    { "path": "src/a.ts", "old_string": "foo", "new_string": "bar" },
+    { "path": "src/b.ts", "old_string": "baz", "new_string": "qux" }
+  ]
+}
+```
 
 ---
 
@@ -124,6 +173,10 @@ DeepSeek sends the exact text to replace and its replacement. In `ask` mode you 
   --system <text>                  Override system prompt
   --system-file <file>             System prompt file (default: prompts/default-system.md)
   --print-system                   Print rendered system prompt and exit
+  --skill <name-or-path>           Load a local skill's SKILL.md into the system prompt; repeatable
+  --skills <a,b>                   Comma-separated skills to load
+  --skill-root <dir>               Directory containing skill folders; repeatable
+  --list-skills                    List discovered local skills and exit
   --model <name>                   Model (default: deepseek-v4-flash)
   --base-url <url>                 OpenAI-compatible base URL (default: https://api.deepseek.com)
   --effort <high|max>              Reasoning effort (default: high)
@@ -147,6 +200,31 @@ DeepSeek sends the exact text to replace and its replacement. In `ask` mode you 
   --no-color                       Disable ANSI colors
   -h, --help                       Show help
 ```
+
+### Local skills
+
+`dsw` can load Codex-style local skills by appending their `SKILL.md` files to the system prompt:
+
+```powershell
+dsw -p "use PBC to inspect the page" --skill pbc --permission full
+```
+
+Skill discovery checks, in order:
+
+- directories passed with `--skill-root`
+- directories from `DEEPSEEK_SKILLS_DIR` (path-delimited)
+- `.deepseek-watch/skills` in the current workspace
+- `~/.codex/skills`
+
+Use `--list-skills` to see discovered skills. During a session, DeepSeek can also call `list_skills` and `read_skill` to inspect skills that were not preloaded.
+
+When you resume with a skill, the wrapper refreshes the saved system message and persists the skill list in the session JSON:
+
+```powershell
+dsw --resume --skill pbc -p "continue"
+```
+
+Future resumes of that session reuse the saved skills automatically unless you pass a different `--skill` / `--skills` set.
 
 Quiet outfile mode is meant for detached subagent workflows where console text costs tokens:
 

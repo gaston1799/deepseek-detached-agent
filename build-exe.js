@@ -18,6 +18,7 @@ import { execSync } from "node:child_process";
 import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { build } from "esbuild";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const DIST = resolve(ROOT, "dist", "exe");
@@ -28,7 +29,6 @@ const NODE_EXE = process.execPath;
 
 // Embed the default system prompt so the exe doesn't need the prompts/ dir at runtime.
 const systemPrompt = readFileSync(resolve(ROOT, "prompts", "default-system.md"), "utf8");
-const DEFINE_SYSTEM_PROMPT = `__SYSTEM_PROMPT__=${JSON.stringify(systemPrompt)}`;
 
 const ENTRIES = [
   { name: "dsw",    src: "src/deepseek-watch.js" },
@@ -50,11 +50,16 @@ for (const { name, src } of ENTRIES) {
   const exe    = resolve(DIST, `${name}.exe`);
 
   // 1. Bundle
-  run(
-    `npx esbuild "${resolve(ROOT, src)}" --bundle --platform=node --format=cjs` +
-    ` --external:"node:*" --define:${DEFINE_SYSTEM_PROMPT} --outfile="${cjs}"`,
-    "bundle"
-  );
+  process.stdout.write("  ▸ bundle\n");
+  await build({
+    entryPoints: [resolve(ROOT, src)],
+    bundle: true,
+    platform: "node",
+    format: "cjs",
+    external: ["node:*"],
+    define: { __SYSTEM_PROMPT__: JSON.stringify(systemPrompt) },
+    outfile: cjs
+  });
 
   // 2. SEA config + blob
   writeFileSync(config, JSON.stringify({

@@ -1,0 +1,6 @@
+{
+  "name": "deepseek-smoke",
+  "purpose": "tool testing",
+  "marker": "SMOKE_TARGET data"
+}
+

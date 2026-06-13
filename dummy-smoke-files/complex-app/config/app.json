@@ -1,0 +1,6 @@
+{
+  "service": "complex-smoke-app",
+  "version": "0.0.0",
+  "featureFlag": "production"
+}
+

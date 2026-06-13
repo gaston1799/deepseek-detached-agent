@@ -1,0 +1,4 @@
+This file exists to test recursive listing and tree output.
+
+SMOKE_TARGET deep nested file
+

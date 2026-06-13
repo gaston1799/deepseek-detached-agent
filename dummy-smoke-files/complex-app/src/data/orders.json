@@ -1,0 +1,5 @@
+[
+  { "id": "ord-100", "total": 19.95, "status": "open" },
+  { "id": "ord-101", "total": 42.50, "status": "closed" }
+]
+

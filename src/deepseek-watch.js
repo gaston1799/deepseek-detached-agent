@@ -1,9 +1,10 @@
 #!/usr/bin/env node
-import { mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
-import { platform, release, arch, userInfo } from "node:os";
-import { dirname, isAbsolute, resolve, relative } from "node:path";
+import { appendFile, mkdir, open, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { closeSync, openSync } from "node:fs";
+import { platform, release, arch, userInfo, homedir } from "node:os";
+import { dirname, extname, isAbsolute, join, resolve, relative, delimiter } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import { createInterface } from "node:readline/promises";
+import { createInterface } from "node:readline";
 import { deepSeekHttpError } from "./api-error.js";
 import { configPath, getDeepSeekApiKey, setDeepSeekApiKey } from "./config.js";
 import { applyThinkingOptions } from "./deepseek-request.js";
@@ -11,10 +12,10 @@ import { listSessions, newSession, newSessionPath, readSession, sessionPath, tou
 
 const DEFAULT_BASE_URL = "https://api.deepseek.com";
 const DEFAULT_MODEL = "deepseek-v4-flash";
-const DEFAULT_SYSTEM_PROMPT_FILE = new URL("../prompts/default-system.md", import.meta.url);
 // __SYSTEM_PROMPT__ is replaced with the file's content by the exe build step (esbuild --define).
 // In normal dev/npm installs it is undefined and the file is read at runtime instead.
 const EMBEDDED_SYSTEM_PROMPT = typeof __SYSTEM_PROMPT__ !== "undefined" ? __SYSTEM_PROMPT__ : null;
+const DEFAULT_SYSTEM_PROMPT_FILE = EMBEDDED_SYSTEM_PROMPT ? null : new URL("../prompts/default-system.md", import.meta.url);
 
 function usage() {
   return `dsw  (alias: d)
@@ -34,6 +35,10 @@ Options:
   --system <text>              System prompt text.
   --system-file <file>         System prompt file. Default: prompts/default-system.md
   --print-system               Print the rendered system prompt and exit.
+  --skill <name-or-path>        Load a local skill's SKILL.md into the system prompt. Repeatable.
+  --skills <a,b>               Comma-separated skills to load.
+  --skill-root <dir>           Directory containing skill folders. Repeatable.
+  --list-skills                List discovered local skills and exit.
   --model <name>               DeepSeek model. Default: deepseek-v4-flash
   --base-url <url>             OpenAI-compatible base URL. Default: https://api.deepseek.com
   --effort <high|max>          Reasoning effort. Default: high
@@ -81,6 +86,9 @@ function parseArgs(argv) {
     resume: false,
     dangerouslyAutoRunCommands: false,
     tools: true,
+    skills: [],
+    skillRoots: [],
+    listSkills: false,
     color: process.env.NO_COLOR ? false : process.stdout.isTTY
   };
 
@@ -99,6 +107,10 @@ function parseArgs(argv) {
     else if (arg === "--system") opts.system = next();
     else if (arg === "--system-file") opts.systemFile = next();
     else if (arg === "--print-system") opts.printSystem = true;
+    else if (arg === "--skill") opts.skills.push(next());
+    else if (arg === "--skills") opts.skills.push(...next().split(",").map((item) => item.trim()).filter(Boolean));
+    else if (arg === "--skill-root") opts.skillRoots.push(next());
+    else if (arg === "--list-skills") opts.listSkills = true;
     else if (arg === "--model") opts.model = next();
     else if (arg === "--base-url") opts.baseUrl = next();
     else if (arg === "--effort") opts.effort = next();
@@ -127,7 +139,7 @@ function parseArgs(argv) {
 }
 
 function validateOpts(opts) {
-  if (opts.help || opts.printSystem) return;
+  if (opts.help || opts.printSystem || opts.listSkills) return;
   const promptSources = [opts.prompt, opts.promptFile, opts.stdin].filter(Boolean).length;
   if (promptSources === 0) throw new Error("Provide --prompt, --prompt-file, or --stdin.");
   if (promptSources > 1) throw new Error("Use only one prompt source.");
@@ -156,6 +168,140 @@ async function loadPrompt(opts) {
   return opts.prompt;
 }
 
+function defaultSkillRoots(opts = {}) {
+  const roots = [
+    ...(opts.skillRoots || []),
+    ...(process.env.DEEPSEEK_SKILLS_DIR ? process.env.DEEPSEEK_SKILLS_DIR.split(delimiter) : []),
+    ".deepseek-watch/skills",
+    join(homedir(), ".codex", "skills")
+  ];
+  return [...new Set(roots.filter(Boolean).map((root) => resolve(root)))];
+}
+
+function parseSkillFrontmatter(markdown, fallbackName) {
+  const text = String(markdown || "");
+  const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  const meta = { name: fallbackName, description: "" };
+  if (!match) return meta;
+  for (const line of match[1].split(/\r?\n/)) {
+    const pair = line.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
+    if (!pair) continue;
+    const key = pair[1];
+    const value = pair[2].trim().replace(/^["']|["']$/g, "");
+    if (key === "name" && value) meta.name = value;
+    if (key === "description" && value) meta.description = value;
+  }
+  return meta;
+}
+
+async function discoverSkills(opts = {}) {
+  const roots = defaultSkillRoots(opts);
+  const skills = [];
+  const seen = new Set();
+  for (const root of roots) {
+    let entries;
+    try {
+      entries = await readdir(root, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+      const skillFile = join(root, entry.name, "SKILL.md");
+      let text;
+      try {
+        text = await readFile(skillFile, "utf8");
+      } catch {
+        continue;
+      }
+      const meta = parseSkillFrontmatter(text, entry.name);
+      const key = `${meta.name}\0${skillFile}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      skills.push({
+        name: meta.name,
+        folder: entry.name,
+        description: meta.description,
+        root,
+        path: skillFile
+      });
+    }
+  }
+  return skills.sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
+}
+
+async function resolveSkill(opts, spec) {
+  const raw = String(spec || "").trim();
+  if (!raw) throw new Error("skill name or path must be non-empty.");
+
+  const direct = resolve(raw);
+  const candidates = [
+    direct,
+    join(direct, "SKILL.md")
+  ];
+  for (const candidate of candidates) {
+    try {
+      const info = await stat(candidate);
+      if (info.isFile()) {
+        const text = await readFile(candidate, "utf8");
+        const meta = parseSkillFrontmatter(text, raw);
+        return { ...meta, path: candidate, content: text };
+      }
+    } catch {}
+  }
+
+  const skills = await discoverSkills(opts);
+  const found = skills.find((skill) => skill.name === raw || skill.folder === raw);
+  if (!found) throw new Error(`Skill not found: ${raw}. Use --list-skills or list_skills.`);
+  const content = await readFile(found.path, "utf8");
+  return { name: found.name, description: found.description, path: found.path, content };
+}
+
+async function renderLoadedSkills(opts) {
+  if (!opts.skills?.length) return "";
+  const loaded = [];
+  for (const spec of opts.skills) {
+    const skill = await resolveSkill(opts, spec);
+    loaded.push([
+      `## Skill: ${skill.name}`,
+      `Path: ${skill.path}`,
+      "",
+      skill.content.trim()
+    ].join("\n"));
+  }
+  return [
+    "",
+    "---",
+    "",
+    "Loaded local skills:",
+    "",
+    ...loaded
+  ].join("\n");
+}
+
+function formatSkillList(skills) {
+  if (!skills.length) return "No skills found.";
+  return skills.map((skill) => {
+    const desc = skill.description ? ` - ${skill.description}` : "";
+    return `${skill.name}${desc}\n  ${skill.path}`;
+  }).join("\n");
+}
+
+function normalizeList(values) {
+  return [...new Set((values || []).map((value) => String(value || "").trim()).filter(Boolean))];
+}
+
+function updateSystemMessage(session, systemPrompt) {
+  const messages = Array.isArray(session.messages) ? session.messages : [];
+  const index = messages.findIndex((message) => message.role === "system");
+  if (index >= 0) {
+    messages[index] = { ...messages[index], content: systemPrompt };
+  } else {
+    messages.unshift({ role: "system", content: systemPrompt });
+  }
+  session.messages = messages;
+}
+
 function gitBranch() {
   const result = spawnSync("git", ["branch", "--show-current"], {
     cwd: process.cwd(),
@@ -179,7 +325,7 @@ function runtimeContext() {
 }
 
 async function loadSystemPrompt(opts) {
-  if (opts.system) return opts.system.replace("{{context}}", runtimeContext());
+  if (opts.system) return `${opts.system.replace("{{context}}", runtimeContext())}${await renderLoadedSkills(opts)}`;
   let template;
   if (opts.systemFile) {
     template = await readFile(resolve(opts.systemFile), "utf8");
@@ -188,7 +334,7 @@ async function loadSystemPrompt(opts) {
   } else {
     template = await readFile(DEFAULT_SYSTEM_PROMPT_FILE, "utf8");
   }
-  return template.replace("{{context}}", runtimeContext());
+  return `${template.replace("{{context}}", runtimeContext())}${await renderLoadedSkills(opts)}`;
 }
 
 function color(opts, code, text) {
@@ -227,6 +373,131 @@ function red(opts, text) {
 function bold(opts, text) {
   return color(opts, "1", text);
 }
+
+// ── Workspace traversal helpers ────────────────────────────────────────────
+
+const DEFAULT_TRAVERSE_EXCLUDES = [
+  ".git", ".deepseek-watch", "node_modules", "dist", "build", "out", ".next", ".nuxt",
+  ".cache", "__pycache__", "coverage", ".nyc_output", ".tsbuildinfo"
+];
+
+const BINARY_EXTS = new Set([
+  ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".tiff",
+  ".pdf", ".zip", ".tar", ".gz", ".bz2", ".7z", ".rar",
+  ".exe", ".dll", ".so", ".dylib", ".bin", ".dat",
+  ".db", ".sqlite", ".sqlite3", ".wasm",
+  ".ttf", ".otf", ".woff", ".woff2",
+  ".mp3", ".mp4", ".avi", ".mov", ".wav", ".ogg", ".mkv",
+  ".class", ".jar", ".pyc"
+]);
+
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function globToRegex(pattern) {
+  let re = "";
+  let i = 0;
+  const norm = pattern.replace(/\\/g, "/");
+  while (i < norm.length) {
+    const ch = norm[i];
+    if (ch === "*" && norm[i + 1] === "*") {
+      re += ".*";
+      i += 2;
+      if (norm[i] === "/") i++;
+    } else if (ch === "*") {
+      re += "[^/]*";
+      i++;
+    } else if (ch === "?") {
+      re += "[^/]";
+      i++;
+    } else if (ch === "{") {
+      const end = norm.indexOf("}", i);
+      if (end === -1) { re += "\\{"; i++; }
+      else {
+        const alts = norm.slice(i + 1, end).split(",").map(escapeRegex);
+        re += `(?:${alts.join("|")})`;
+        i = end + 1;
+      }
+    } else if (/[.+^$|()[\]\\]/.test(ch)) {
+      re += `\\${ch}`;
+      i++;
+    } else {
+      re += ch;
+      i++;
+    }
+  }
+  return new RegExp(`^${re}$`, "i");
+}
+
+async function isBinaryFile(absPath) {
+  if (BINARY_EXTS.has(extname(absPath).toLowerCase())) return true;
+  try {
+    const fh = await open(absPath, "r");
+    try {
+      const buf = Buffer.alloc(512);
+      const { bytesRead } = await fh.read(buf, 0, 512, 0);
+      return buf.subarray(0, bytesRead).includes(0);
+    } finally {
+      await fh.close();
+    }
+  } catch {
+    return false;
+  }
+}
+
+async function* walkDir(root, dir, { excludeDirNames = DEFAULT_TRAVERSE_EXCLUDES, excludeGlobRxs = [], type = "all", depth = 0, maxDepth = Infinity } = {}) {
+  let entries;
+  try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
+  for (const entry of entries) {
+    const abs = join(dir, entry.name);
+    const rel = relative(root, abs).replace(/\\/g, "/");
+    if (entry.isDirectory()) {
+      if (excludeDirNames.includes(entry.name)) continue;
+      if (excludeGlobRxs.some((rx) => rx.test(rel))) continue;
+      if (type !== "file") yield { absPath: abs, relPath: rel, isDir: true };
+      if (depth < maxDepth) yield* walkDir(root, abs, { excludeDirNames, excludeGlobRxs, type, depth: depth + 1, maxDepth });
+    } else if (entry.isFile()) {
+      if (excludeGlobRxs.some((rx) => rx.test(rel))) continue;
+      if (type !== "dir") yield { absPath: abs, relPath: rel, isDir: false };
+    }
+  }
+}
+
+async function runGit(gitArgs, cwd = process.cwd()) {
+  return new Promise((resolvePromise) => {
+    const child = spawn("git", gitArgs, { cwd, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => child.kill(), 30000);
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", (err) => { clearTimeout(timer); resolvePromise({ ok: false, out: "", err: err.message }); });
+    child.on("close", (code) => { clearTimeout(timer); resolvePromise({ ok: code === 0, out: stdout, err: stderr }); });
+  });
+}
+
+async function buildTreeLines(absDir, prefix, depth, maxDepth) {
+  if (depth > maxDepth) return [];
+  let entries;
+  try { entries = await readdir(absDir, { withFileTypes: true }); } catch { return []; }
+  const visible = entries.filter((e) => !DEFAULT_TRAVERSE_EXCLUDES.includes(e.name));
+  const lines = [];
+  for (let i = 0; i < visible.length; i++) {
+    const entry = visible[i];
+    const isLast = i === visible.length - 1;
+    lines.push(`${prefix}${isLast ? "└── " : "├── "}${entry.name}${entry.isDirectory() ? "/" : ""}`);
+    if (entry.isDirectory() && depth < maxDepth) {
+      const sub = await buildTreeLines(join(absDir, entry.name), prefix + (isLast ? "    " : "│   "), depth + 1, maxDepth);
+      lines.push(...sub);
+    }
+  }
+  return lines;
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 
 function label(opts, icon, text, code = "1;36") {
   return color(opts, code, `${icon} ${text}`);
@@ -290,6 +561,374 @@ function toolDisplayResult(name, args, result) {
   return result;
 }
 
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function jsonResult(value) {
+  return JSON.stringify(value, null, 2);
+}
+
+function parseCommandLineArgs(value) {
+  const text = String(value || "").trim();
+  if (!text) return [];
+  const args = [];
+  let current = "";
+  let quote = "";
+  let escaped = false;
+  for (const ch of text) {
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) quote = "";
+      else current += ch;
+      continue;
+    }
+    if (ch === "\"" || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (current) {
+        args.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += ch;
+  }
+  if (escaped) current += "\\";
+  if (quote) throw new Error("Unclosed quote in cli_args.");
+  if (current) args.push(current);
+  return args;
+}
+
+function compactMessageForSummary(message, max = 500) {
+  const role = message.role || "message";
+  if (role === "tool") return `[tool ${message.tool_call_id || ""}] ${compactText(message.content, max)}`;
+  if (message.tool_calls?.length) {
+    const names = message.tool_calls.map((call) => call.function?.name || "tool").join(", ");
+    const content = compactText(message.content || "", max);
+    return content ? `[assistant tools: ${names}] ${content}` : `[assistant tools: ${names}]`;
+  }
+  return `[${role}] ${compactText(message.content || "", max)}`;
+}
+
+function decodeHtmlEntities(value) {
+  const named = {
+    amp: "&",
+    apos: "'",
+    gt: ">",
+    lt: "<",
+    nbsp: " ",
+    quot: "\""
+  };
+  return String(value || "").replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (match, entity) => {
+    const key = entity.toLowerCase();
+    if (key[0] === "#") {
+      const radix = key[1] === "x" ? 16 : 10;
+      const codePoint = Number.parseInt(key.slice(radix === 16 ? 2 : 1), radix);
+      return Number.isFinite(codePoint) ? String.fromCodePoint(codePoint) : match;
+    }
+    return Object.prototype.hasOwnProperty.call(named, key) ? named[key] : match;
+  });
+}
+
+function stripHtml(value) {
+  return decodeHtmlEntities(String(value || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim());
+}
+
+function htmlToText(value) {
+  const html = String(value || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+    .replace(/<svg[\s\S]*?<\/svg>/gi, " ")
+    .replace(/<(br|hr)\b[^>]*>/gi, "\n")
+    .replace(/<\/(p|div|section|article|main|header|footer|aside|nav|h[1-6]|li|tr|blockquote|pre)>/gi, "\n")
+    .replace(/<[^>]+>/g, " ");
+  return decodeHtmlEntities(html)
+    .replace(/\r\n/g, "\n")
+    .replace(/[ \t\f\v]+/g, " ")
+    .replace(/\n\s+/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function htmlTitle(value) {
+  const match = String(value || "").match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  return match ? stripHtml(match[1]) : "";
+}
+
+function unwrapDuckDuckGoUrl(rawUrl) {
+  const decoded = decodeHtmlEntities(rawUrl);
+  try {
+    const url = new URL(decoded, "https://duckduckgo.com");
+    const uddg = url.searchParams.get("uddg");
+    return uddg || url.href;
+  } catch {
+    return decoded;
+  }
+}
+
+function formatSearchResults(provider, query, results) {
+  if (!results.length) return `No ${provider} results for: ${query}`;
+  const lines = [`${provider} results for: ${query}`, ""];
+  results.forEach((result, index) => {
+    lines.push(`${index + 1}. ${result.title || "(untitled)"}`);
+    lines.push(`   URL: ${result.url}`);
+    if (result.snippet) lines.push(`   Snippet: ${result.snippet}`);
+    lines.push("");
+  });
+  return lines.join("\n").trimEnd();
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function parseDuckDuckGoHtml(html, maxResults) {
+  const results = [];
+  const blockPattern = /<div[^>]+class="[^"]*\bresult\b[^"]*"[\s\S]*?(?=<div[^>]+class="[^"]*\bresult\b|<\/body>)/gi;
+  const blocks = html.match(blockPattern) || [];
+  for (const block of blocks) {
+    const anchor = block.match(/<a[^>]+class="[^"]*\bresult__a\b[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i);
+    if (!anchor) continue;
+    const url = unwrapDuckDuckGoUrl(anchor[1]);
+    const title = stripHtml(anchor[2]);
+    if (!url || !title) continue;
+    const snippetMatch = block.match(/<a[^>]+class="[^"]*\bresult__snippet\b[^"]*"[^>]*>([\s\S]*?)<\/a>|<div[^>]+class="[^"]*\bresult__snippet\b[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
+    const snippet = stripHtml(snippetMatch?.[1] || snippetMatch?.[2] || "");
+    results.push({ title, url, snippet });
+    if (results.length >= maxResults) break;
+  }
+  return results;
+}
+
+function parseDuckDuckGoLiteHtml(html, maxResults) {
+  const results = [];
+  const anchorPattern = /<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+  let match;
+  while ((match = anchorPattern.exec(html)) && results.length < maxResults) {
+    const title = stripHtml(match[2]);
+    const url = unwrapDuckDuckGoUrl(match[1]);
+    if (!title || !url) continue;
+    if (/duckduckgo\.com\/(html|lite)/i.test(url)) continue;
+    if (results.some((result) => result.url === url)) continue;
+    results.push({ title, url, snippet: "" });
+  }
+  return results;
+}
+
+async function duckDuckGoSearch(query, maxResults, timeRange) {
+  const params = new URLSearchParams({ q: query });
+  const timeMap = { day: "d", week: "w", month: "m", year: "y" };
+  if (timeMap[timeRange]) params.set("df", timeMap[timeRange]);
+  const response = await fetchWithTimeout("https://html.duckduckgo.com/html/", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "User-Agent": "Mozilla/5.0 deepseek-detached-agent"
+    },
+    body: params.toString()
+  });
+  if (!response.ok) throw new Error(`DuckDuckGo search failed: HTTP ${response.status}`);
+  const html = await response.text();
+  const results = parseDuckDuckGoHtml(html, maxResults);
+  if (results.length) return formatSearchResults("DuckDuckGo", query, results);
+
+  const liteUrl = new URL("https://lite.duckduckgo.com/lite/");
+  liteUrl.searchParams.set("q", query);
+  if (timeMap[timeRange]) liteUrl.searchParams.set("df", timeMap[timeRange]);
+  const liteResponse = await fetchWithTimeout(liteUrl, {
+    headers: { "User-Agent": "Mozilla/5.0 deepseek-detached-agent" }
+  });
+  if (!liteResponse.ok) throw new Error(`DuckDuckGo Lite search failed: HTTP ${liteResponse.status}`);
+  const liteHtml = await liteResponse.text();
+  return formatSearchResults("DuckDuckGo Lite", query, parseDuckDuckGoLiteHtml(liteHtml, maxResults));
+}
+
+async function braveSearch(query, maxResults) {
+  const key = process.env.BRAVE_SEARCH_API_KEY;
+  if (!key) return null;
+  const url = new URL("https://api.search.brave.com/res/v1/web/search");
+  url.searchParams.set("q", query);
+  url.searchParams.set("count", String(maxResults));
+  const response = await fetchWithTimeout(url, {
+    headers: {
+      "Accept": "application/json",
+      "X-Subscription-Token": key
+    }
+  });
+  if (!response.ok) throw new Error(`Brave search failed: HTTP ${response.status}`);
+  const data = await response.json();
+  const results = (data.web?.results || []).slice(0, maxResults).map((item) => ({
+    title: stripHtml(item.title),
+    url: item.url,
+    snippet: stripHtml(item.description)
+  }));
+  return formatSearchResults("Brave Search", query, results);
+}
+
+async function webSearch(args) {
+  const query = String(args.query || "").trim();
+  if (!query) throw new Error("query must be a non-empty string.");
+  const maxResults = Math.min(Math.max(Number(args.max_results) || 5, 1), 10);
+  const site = String(args.site || "").trim();
+  const scopedQuery = site ? `${query} site:${site}` : query;
+  const brave = await braveSearch(scopedQuery, maxResults);
+  if (brave) return brave;
+  return duckDuckGoSearch(scopedQuery, maxResults, args.time_range);
+}
+
+async function webFetch(args) {
+  const rawUrl = String(args.url || "").trim();
+  if (!rawUrl) throw new Error("url must be a non-empty string.");
+  const url = new URL(rawUrl);
+  if (!["http:", "https:"].includes(url.protocol)) throw new Error("url must use http or https.");
+
+  const maxChars = Math.min(Math.max(Number(args.max_chars) || 12000, 1000), 50000);
+  const offset = Math.max(Number(args.offset) || 0, 0);
+  const response = await fetchWithTimeout(url, {
+    headers: {
+      "Accept": "text/html, text/plain, application/xhtml+xml, application/xml;q=0.9, */*;q=0.5",
+      "User-Agent": "Mozilla/5.0 deepseek-detached-agent"
+    }
+  }, Math.min(Number(args.timeout_ms) || 20000, 60000));
+  if (!response.ok) throw new Error(`Fetch failed: HTTP ${response.status}`);
+
+  const contentType = response.headers.get("content-type") || "";
+  const raw = await response.text();
+  const text = /html|xml|xhtml/i.test(contentType) || /<html|<!doctype html/i.test(raw)
+    ? htmlToText(raw)
+    : raw.replace(/\r\n/g, "\n").trim();
+  const title = /html|xhtml/i.test(contentType) ? htmlTitle(raw) : "";
+  const chunk = text.slice(offset, offset + maxChars);
+  const nextOffset = offset + maxChars < text.length ? offset + maxChars : null;
+
+  if (args.structured) {
+    return JSON.stringify({
+      url: url.href,
+      title,
+      content_type: contentType,
+      content: chunk,
+      next_offset: nextOffset,
+      total_chars: text.length
+    }, null, 2);
+  }
+
+  const lines = [`URL: ${url.href}`];
+  if (title) lines.push(`Title: ${title}`);
+  if (contentType) lines.push(`Content-Type: ${contentType}`);
+  lines.push("", chunk || "(no readable text)");
+  if (nextOffset != null) lines.push("", `[chunk ${offset}-${offset + chunk.length} of ${text.length} chars; continue with offset ${nextOffset}]`);
+  return lines.join("\n");
+}
+
+const IMAGE_MIME_BY_EXT = new Map([
+  [".png", "image/png"],
+  [".jpg", "image/jpeg"],
+  [".jpeg", "image/jpeg"],
+  [".gif", "image/gif"],
+  [".webp", "image/webp"],
+  [".bmp", "image/bmp"],
+  [".svg", "image/svg+xml"]
+]);
+
+function imageMime(path) {
+  return IMAGE_MIME_BY_EXT.get(extname(path).toLowerCase()) || "application/octet-stream";
+}
+
+function imageDimensions(buffer, mime) {
+  if (mime === "image/png" && buffer.length >= 24 && buffer.toString("ascii", 1, 4) === "PNG") {
+    return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
+  }
+  if (mime === "image/gif" && buffer.length >= 10 && buffer.toString("ascii", 0, 3) === "GIF") {
+    return { width: buffer.readUInt16LE(6), height: buffer.readUInt16LE(8) };
+  }
+  if (mime === "image/bmp" && buffer.length >= 26 && buffer.toString("ascii", 0, 2) === "BM") {
+    return { width: buffer.readUInt32LE(18), height: Math.abs(buffer.readInt32LE(22)) };
+  }
+  if (mime === "image/webp" && buffer.length >= 30 && buffer.toString("ascii", 0, 4) === "RIFF" && buffer.toString("ascii", 8, 12) === "WEBP") {
+    const chunk = buffer.toString("ascii", 12, 16);
+    if (chunk === "VP8X" && buffer.length >= 30) {
+      return {
+        width: 1 + buffer.readUIntLE(24, 3),
+        height: 1 + buffer.readUIntLE(27, 3)
+      };
+    }
+    if (chunk === "VP8 " && buffer.length >= 30) {
+      return { width: buffer.readUInt16LE(26) & 0x3fff, height: buffer.readUInt16LE(28) & 0x3fff };
+    }
+  }
+  if (mime === "image/svg+xml") {
+    const text = buffer.subarray(0, Math.min(buffer.length, 5000)).toString("utf8");
+    const svg = text.match(/<svg\b[^>]*>/i)?.[0] || "";
+    const width = Number.parseFloat(svg.match(/\bwidth=["']?([0-9.]+)/i)?.[1] || "");
+    const height = Number.parseFloat(svg.match(/\bheight=["']?([0-9.]+)/i)?.[1] || "");
+    if (Number.isFinite(width) && Number.isFinite(height)) return { width, height };
+    const viewBox = svg.match(/\bviewBox=["']\s*[-0-9.]+\s+[-0-9.]+\s+([0-9.]+)\s+([0-9.]+)/i);
+    if (viewBox) return { width: Number.parseFloat(viewBox[1]), height: Number.parseFloat(viewBox[2]) };
+  }
+  if (mime === "image/jpeg" && buffer.length > 4 && buffer[0] === 0xff && buffer[1] === 0xd8) {
+    let offset = 2;
+    while (offset + 9 < buffer.length) {
+      if (buffer[offset] !== 0xff) { offset += 1; continue; }
+      const marker = buffer[offset + 1];
+      const length = buffer.readUInt16BE(offset + 2);
+      if (length < 2) break;
+      if (marker >= 0xc0 && marker <= 0xc3) {
+        return { width: buffer.readUInt16BE(offset + 7), height: buffer.readUInt16BE(offset + 5) };
+      }
+      offset += 2 + length;
+    }
+  }
+  return null;
+}
+
+async function viewImage(args) {
+  const target = assertInsideWorkspace(args.path);
+  const info = await stat(target);
+  if (!info.isFile()) throw new Error("Path is not a file.");
+  const mime = imageMime(args.path);
+  if (!mime.startsWith("image/")) throw new Error(`Unsupported image extension: ${extname(args.path) || "(none)"}`);
+  const maxBytes = Math.min(Math.max(Number(args.max_bytes) || 4000000, 1), 12000000);
+  const includeData = args.include_data_url !== false;
+  const buffer = await readFile(target);
+  const dimensions = imageDimensions(buffer, mime);
+  const result = {
+    path: args.path,
+    mime,
+    size_bytes: info.size,
+    dimensions,
+    data_url_included: includeData && buffer.length <= maxBytes
+  };
+  if (includeData && buffer.length <= maxBytes) {
+    result.data_url = `data:${mime};base64,${buffer.toString("base64")}`;
+  } else if (includeData) {
+    result.note = `Image is ${buffer.length} bytes, above max_bytes=${maxBytes}; raise max_bytes or set include_data_url=false for metadata only.`;
+  }
+  return JSON.stringify(result, null, 2);
+}
+
 function compactText(value, max = 900) {
   const text = String(value || "").replace(/\r\n/g, "\n").trim();
   if (text.length <= max) return text;
@@ -349,75 +988,25 @@ function sessionLabel(item, index) {
   return `${String(index + 1).padStart(2, " ")}  ${when} ${permission}  ${prompt || "(no prompt)"}`;
 }
 
-function renderSessionPicker(opts, items, selected) {
-  process.stdout.write("\x1b[2J\x1b[H");
-  process.stdout.write(`  ${bold(opts, "DeepSeek  sessions")}\n`);
-  process.stdout.write(`  ${dim(opts, "↑↓ navigate  Enter select  Esc cancel")}\n\n`);
-  items.forEach((item, index) => {
-    const marker = index === selected ? color(opts, "1;32", "▸") : " ";
-    const line = `  ${marker} ${sessionLabel(item, index)}`;
-    process.stdout.write(`${index === selected ? bold(opts, line) : dim(opts, line)}\n`);
-  });
-}
-
-function renderDashboard(opts, items, selected) {
-  process.stdout.write("\x1b[2J\x1b[H");
-  process.stdout.write(`  ${bold(opts, "DeepSeek  watch")}\n`);
-  process.stdout.write(`  ${dim(opts, "↑↓ navigate  Enter select  Esc quit")}\n\n`);
-  items.forEach((item, index) => {
-    const marker = index === selected ? color(opts, "1;32", "▸") : " ";
-    const line = `  ${marker} ${item.label}`;
-    process.stdout.write(`${index === selected ? bold(opts, line) : dim(opts, line)}\n`);
-  });
-}
-
 async function pickMenu(opts, title, hint, items) {
-  return new Promise((resolvePromise) => {
-    let selected = 0;
-    const stdin = process.stdin;
-    const cleanup = () => {
-      stdin.setRawMode(false);
-      stdin.pause();
-      stdin.removeListener("data", onData);
-      process.stdout.write("\n");
-    };
-    const render = () => {
-      process.stdout.write("\x1b[2J\x1b[H");
-      process.stdout.write(`  ${bold(opts, title)}\n`);
-      process.stdout.write(`  ${dim(opts, hint)}\n\n`);
-      items.forEach((item, index) => {
-        const marker = index === selected ? color(opts, "1;32", "▸") : " ";
-        const line = `  ${marker} ${item.label}`;
-        process.stdout.write(`${index === selected ? bold(opts, line) : dim(opts, line)}\n`);
-      });
-    };
-    const onData = (chunk) => {
-      const key = chunk.toString("utf8");
-      if (key === "\u0003" || key === "\u001b") {
-        cleanup();
-        resolvePromise("quit");
-        return;
-      }
-      if (key === "\r" || key === "\n") {
-        const id = items[selected].id;
-        cleanup();
-        resolvePromise(id);
-        return;
-      }
-      if (key === "\u001b[A") selected = Math.max(0, selected - 1);
-      if (key === "\u001b[B") selected = Math.min(items.length - 1, selected + 1);
-      render();
-    };
-
-    stdin.resume();
-    stdin.setRawMode(true);
-    stdin.on("data", onData);
-    render();
+  process.stdout.write(`\n  ${bold(opts, title)}\n`);
+  process.stdout.write(`  ${dim(opts, hint)}\n\n`);
+  items.forEach((item, i) => {
+    process.stdout.write(`  ${dim(opts, `${i + 1}.`)} ${item.label}\n`);
   });
+  process.stdout.write("\n");
+  while (true) {
+    const answer = await promptLine(`  Enter choice (1-${items.length}, q to quit): `);
+    const trimmed = answer.trim().toLowerCase();
+    if (trimmed === "q" || trimmed === "") return "quit";
+    const n = parseInt(trimmed, 10);
+    if (n >= 1 && n <= items.length) return items[n - 1].id;
+    process.stdout.write(`  Invalid. Enter 1-${items.length} or q.\n`);
+  }
 }
 
 async function pickDashboardAction(opts) {
-  return pickMenu(opts, "DeepSeek Watch", "Arrow keys to move, Enter to select, Esc/Ctrl+C to quit.", [
+  return pickMenu(opts, "DeepSeek Watch", "Enter a number and press Enter. q to quit.", [
     { id: "new", label: "New run" },
     { id: "resume", label: "Resume session" },
     { id: "config", label: "Show config path" },
@@ -426,61 +1015,19 @@ async function pickDashboardAction(opts) {
   ]);
 }
 
-async function promptLine(question) {
-  if (process.stdin.isTTY) {
-    return new Promise((resolvePromise) => {
-      let value = "";
-      const stdin = process.stdin;
-      const cleanup = () => {
-        stdin.setRawMode(false);
-        stdin.pause();
-        stdin.removeListener("data", onData);
-        process.stdout.write("\n");
-      };
-      const onData = (chunk) => {
-        const key = chunk.toString("utf8");
-        if (key === "\u0003") {
-          cleanup();
-          resolvePromise("/exit");
-          return;
-        }
-        if (key === "\u001b") {
-          // Clear typed input and redraw prompt — ESC at idle does nothing actionable
-          process.stdout.write("\b \b".repeat(value.length));
-          value = "";
-          return;
-        }
-        if (key === "\r" || key === "\n") {
-          cleanup();
-          resolvePromise(value);
-          return;
-        }
-        if (key === "\b" || key === "\u007f") {
-          if (value.length > 0) {
-            value = value.slice(0, -1);
-            process.stdout.write("\b \b");
-          }
-          return;
-        }
-        if (key >= " ") {
-          value += key;
-          process.stdout.write(key);
-        }
-      };
-
-      process.stdout.write(question);
-      stdin.resume();
-      stdin.setRawMode(true);
-      stdin.on("data", onData);
+function promptLine(question) {
+  return new Promise((resolve) => {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    rl.on("SIGINT", () => {
+      rl.close();
+      process.stdout.write("\n");
+      process.exit(0);
     });
-  }
-
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-  try {
-    return await rl.question(question);
-  } finally {
-    rl.close();
-  }
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer);
+    });
+  });
 }
 
 async function pickPermission(opts) {
@@ -541,38 +1088,19 @@ async function pickSession(opts) {
   if (items.length === 0) throw new Error("No saved sessions found.");
   if (!process.stdin.isTTY) return items[0].path;
 
-  return new Promise((resolvePromise, reject) => {
-    let selected = 0;
-    const stdin = process.stdin;
-    const cleanup = () => {
-      stdin.setRawMode(false);
-      stdin.pause();
-      stdin.removeListener("data", onData);
-      process.stdout.write("\n");
-    };
-    const onData = (chunk) => {
-      const key = chunk.toString("utf8");
-      if (key === "\u0003" || key === "\u001b") {
-        cleanup();
-        reject(new Error("Session selection cancelled."));
-        return;
-      }
-      if (key === "\r" || key === "\n") {
-        const path = items[selected].path;
-        cleanup();
-        resolvePromise(path);
-        return;
-      }
-      if (key === "\u001b[A") selected = Math.max(0, selected - 1);
-      if (key === "\u001b[B") selected = Math.min(items.length - 1, selected + 1);
-      renderSessionPicker(opts, items, selected);
-    };
-
-    stdin.resume();
-    stdin.setRawMode(true);
-    stdin.on("data", onData);
-    renderSessionPicker(opts, items, selected);
+  process.stdout.write(`\n  ${bold(opts, "Sessions")}\n\n`);
+  items.forEach((item, i) => {
+    process.stdout.write(`  ${sessionLabel(item, i)}\n`);
   });
+  process.stdout.write("\n");
+  while (true) {
+    const answer = await promptLine(`  Choose session (1-${items.length}, q to cancel): `);
+    const trimmed = answer.trim().toLowerCase();
+    if (trimmed === "q" || trimmed === "") throw new Error("Session selection cancelled.");
+    const n = parseInt(trimmed, 10);
+    if (n >= 1 && n <= items.length) return items[n - 1].path;
+    process.stdout.write(`  Invalid. Enter 1-${items.length} or q.\n`);
+  }
 }
 
 function toolSchemas(opts) {
@@ -589,12 +1117,19 @@ function toolSchemas(opts) {
       type: "function",
       function: {
         name: "list_workspace_files",
-        description: "List files and directories under the workspace. Read-only.",
+        description: "List files and directories under the workspace. Supports recursive listing, glob filtering, and metadata. Read-only.",
         parameters: {
           type: "object",
           properties: {
-            path: { type: "string", description: "Workspace-relative directory. Defaults to workspace root." },
-            max: { type: "number", description: "Maximum entries to return. Defaults to 80." }
+            path:             { type: "string",  description: "Workspace-relative directory. Defaults to workspace root." },
+            recursive:        { type: "boolean", description: "Recurse into subdirectories. Default false (flat listing for backwards compat)." },
+            glob:             { type: "string",  description: "Glob pattern to filter entries, e.g. '**/*.ts'." },
+            exclude_glob:     { type: "string",  description: "Glob pattern to exclude entries, e.g. '**/*.min.js'." },
+            exclude_patterns: { type: "array",   items: { type: "string" }, description: "Additional directory names to exclude beyond the default set." },
+            max:              { type: "number",  description: "Max entries to return. Default 200." },
+            offset:           { type: "number",  description: "Pagination cursor. Default 0." },
+            type:             { type: "string",  enum: ["file", "dir", "all"], description: "Filter by entry type. Default all." },
+            include_metadata: { type: "boolean", description: "Include size_bytes and modified_iso per entry. Default false." }
           },
           additionalProperties: false
         }
@@ -608,18 +1143,480 @@ function toolSchemas(opts) {
         parameters: {
           type: "object",
           properties: {
-            path:       { type: "string", description: "Workspace-relative file path." },
-            start_line: { type: "number", description: "First line to read (1-based, inclusive). Returns line text instead of raw bytes." },
-            end_line:   { type: "number", description: "Last line to read (1-based, inclusive). Use with start_line. Defaults to start_line + 99." },
-            max_bytes:  { type: "number", description: "Max bytes to read in byte mode. Defaults to 20000." },
-            offset:     { type: "number", description: "Byte offset to start from in byte mode. Defaults to 0." }
+            path:       { type: "string",  description: "Workspace-relative file path." },
+            start_line: { type: "number",  description: "First line to read (1-based, inclusive). Returns line text instead of raw bytes." },
+            end_line:   { type: "number",  description: "Last line to read (1-based, inclusive). Use with start_line. Defaults to start_line + 99." },
+            max_bytes:  { type: "number",  description: "Max bytes to read in byte mode. Defaults to 20000." },
+            offset:     { type: "number",  description: "Byte offset to start from in byte mode. Defaults to 0." },
+            structured: { type: "boolean", description: "Return JSON {content, next_offset, total_bytes} instead of plain text. Enables cursor-based chained reads." }
           },
           required: ["path"],
           additionalProperties: false
         }
       }
+    },
+    {
+      type: "function",
+      function: {
+        name: "view_image",
+        description: "Read a workspace image file and return JSON metadata, dimensions when detectable, and a base64 data URL when small enough. Read-only.",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Workspace-relative image path." },
+            include_data_url: { type: "boolean", description: "Include a data:image/... base64 URL. Default true." },
+            max_bytes: { type: "number", description: "Maximum image bytes to include in data_url. Default 4000000, max 12000000." }
+          },
+          required: ["path"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "list_skills",
+        description: "List local skills discovered from --skill-root, DEEPSEEK_SKILLS_DIR, .deepseek-watch/skills, and ~/.codex/skills. Read-only.",
+        parameters: { type: "object", properties: {}, additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "read_skill",
+        description: "Read a local skill's SKILL.md by skill name, folder name, or path. Use this before following a skill that was not loaded with --skill. Read-only.",
+        parameters: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "Skill name, skill folder name, SKILL.md path, or skill directory path." }
+          },
+          required: ["name"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "web_search",
+        description: "Search the web for current or external information. Read-only. Uses BRAVE_SEARCH_API_KEY when set, otherwise DuckDuckGo HTML/Lite results.",
+        parameters: {
+          type: "object",
+          properties: {
+            query: { type: "string", description: "Search query." },
+            max_results: { type: "number", description: "Number of results to return, 1-10. Defaults to 5." },
+            site: { type: "string", description: "Optional domain to restrict results, e.g. github.com." },
+            time_range: { type: "string", enum: ["day", "week", "month", "year"], description: "Optional freshness hint for DuckDuckGo fallback." }
+          },
+          required: ["query"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "web_fetch",
+        description: "Fetch a URL and return readable page text. Use after web_search when snippets are not enough. Read-only.",
+        parameters: {
+          type: "object",
+          properties: {
+            url: { type: "string", description: "HTTP or HTTPS URL to fetch." },
+            max_chars: { type: "number", description: "Maximum text characters to return. Default 12000, max 50000." },
+            offset: { type: "number", description: "Character offset for reading the next chunk of a long page. Default 0." },
+            timeout_ms: { type: "number", description: "Fetch timeout in milliseconds. Default 20000, max 60000." },
+            structured: { type: "boolean", description: "Return JSON with content, next_offset, total_chars, title, and content_type." }
+          },
+          required: ["url"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "create_goal",
+        description: "Create or replace the current persistent session goal. Stored in the session JSON.",
+        parameters: {
+          type: "object",
+          properties: {
+            objective: { type: "string", description: "Concrete objective for the session." },
+            token_budget: { type: "number", description: "Optional positive token budget." }
+          },
+          required: ["objective"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "get_goal",
+        description: "Return the current persistent session goal, or null if none exists.",
+        parameters: { type: "object", properties: {}, additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "update_goal",
+        description: "Mark the current goal complete or blocked and optionally add a note.",
+        parameters: {
+          type: "object",
+          properties: {
+            status: { type: "string", enum: ["complete", "blocked"], description: "Final goal status." },
+            note: { type: "string", description: "Optional note explaining the status." }
+          },
+          required: ["status"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "update_plan",
+        description: "Replace the visible persistent session plan with explicit step statuses.",
+        parameters: {
+          type: "object",
+          properties: {
+            explanation: { type: "string", description: "Optional plan update note." },
+            plan: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  step: { type: "string", description: "Task step." },
+                  status: { type: "string", enum: ["pending", "in_progress", "completed"], description: "Step status." }
+                },
+                required: ["step", "status"],
+                additionalProperties: false
+              }
+            }
+          },
+          required: ["plan"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "get_plan",
+        description: "Return the current persistent session plan.",
+        parameters: { type: "object", properties: {}, additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "session_health",
+        description: "Report saved-session health, goal status, plan progress, checkpoints, touched files, and tool-call repair needs.",
+        parameters: { type: "object", properties: {}, additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "checkpoint_session",
+        description: "Append a compact checkpoint to the session JSON.",
+        parameters: {
+          type: "object",
+          properties: {
+            label: { type: "string", description: "Optional checkpoint label." },
+            summary: { type: "string", description: "Optional checkpoint summary." }
+          },
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "summarize_session",
+        description: "Return a compact recent session summary without dumping the full transcript.",
+        parameters: {
+          type: "object",
+          properties: {
+            max_messages: { type: "number", description: "Number of recent non-system messages to summarize. Default 12, max 50." }
+          },
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "handoff_status",
+        description: "Inspect a handoff output file and optional log tail. Read-only.",
+        parameters: {
+          type: "object",
+          properties: {
+            output_file: { type: "string", description: "Workspace-relative handoff output file." },
+            log_file: { type: "string", description: "Optional workspace-relative handoff log file." },
+            tail_lines: { type: "number", description: "Optional log tail line count. Default 40, max 200." }
+          },
+          required: ["output_file"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "handoff_wait",
+        description: "Wait for a handoff output file to appear and optionally print its content. Read-only.",
+        parameters: {
+          type: "object",
+          properties: {
+            output_file: { type: "string", description: "Workspace-relative handoff output file." },
+            timeout_seconds: { type: "number", description: "Timeout in seconds. Default 300, max 7200." },
+            poll_ms: { type: "number", description: "Polling interval in milliseconds. Default 1000." },
+            print_content: { type: "boolean", description: "Include output file content when found. Default false." }
+          },
+          required: ["output_file"],
+          additionalProperties: false
+        }
+      }
     }
   ];
+
+  schemas.push(
+    {
+      type: "function",
+      function: {
+        name: "search_code",
+        description: "Search workspace files for a regex or literal pattern. Skips binary files and common build/dep dirs. Read-only.",
+        parameters: {
+          type: "object",
+          properties: {
+            pattern:          { type: "string",  description: "Regex or literal string to search for." },
+            path:             { type: "string",  description: "Workspace-relative subdirectory to scope the search." },
+            glob:             { type: "string",  description: "File filter glob, e.g. '*.ts' or 'src/**/*.js'." },
+            ignore_case:      { type: "boolean", description: "Case-insensitive match. Default false." },
+            max_results:      { type: "number",  description: "Max matches to return. Default 200." },
+            context_lines:    { type: "number",  description: "Lines of surrounding context per match (0–5). Default 0." },
+            respect_gitignore:{ type: "boolean", description: "Apply default excludes (.git, node_modules, dist, …). Default true." }
+          },
+          required: ["pattern"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "read_text_files",
+        description: "Batch-read multiple workspace files in one call. Returns a JSON object keyed by path. Per-file errors don't fail the batch. Read-only.",
+        parameters: {
+          type: "object",
+          properties: {
+            files: {
+              type: "array",
+              description: "List of files to read.",
+              items: {
+                type: "object",
+                properties: {
+                  path:       { type: "string", description: "Workspace-relative file path." },
+                  start_line: { type: "number", description: "First line (1-based, inclusive)." },
+                  end_line:   { type: "number", description: "Last line (1-based, inclusive)." },
+                  max_bytes:  { type: "number", description: "Max bytes to read. Default 20000." }
+                },
+                required: ["path"],
+                additionalProperties: false
+              }
+            }
+          },
+          required: ["files"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "git_status",
+        description: "Show git working-tree status (short format). Read-only.",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Workspace-relative path to scope." }
+          },
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "git_diff",
+        description: "Show git diff. Defaults to unstaged changes. Read-only.",
+        parameters: {
+          type: "object",
+          properties: {
+            staged:        { type: "boolean", description: "Show staged (indexed) changes. Default false." },
+            target_branch: { type: "string",  description: "Compare against this branch/ref, e.g. 'main'." },
+            path:          { type: "string",  description: "Scope diff to this workspace-relative path." }
+          },
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "git_log",
+        description: "Show git commit log (one-line format). Read-only.",
+        parameters: {
+          type: "object",
+          properties: {
+            path:        { type: "string", description: "Scope log to this workspace-relative path." },
+            max_entries: { type: "number", description: "Max commits to return. Default 20." }
+          },
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "git_blame",
+        description: "Show git blame for a file (who last changed each line). Read-only.",
+        parameters: {
+          type: "object",
+          properties: {
+            file_path:  { type: "string", description: "Workspace-relative file path." },
+            start_line: { type: "number", description: "First line to blame (1-based)." },
+            end_line:   { type: "number", description: "Last line to blame (1-based)." }
+          },
+          required: ["file_path"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "stat_file",
+        description: "Return metadata for a file or directory: size, modification time, type, binary flag. Read-only.",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Workspace-relative path." }
+          },
+          required: ["path"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "glob",
+        description: "Discover workspace files matching a glob pattern (no shell). Read-only.",
+        parameters: {
+          type: "object",
+          properties: {
+            pattern: { type: "string", description: "Glob pattern, e.g. 'packages/*/package.json' or 'src/**/*.ts'." },
+            max:     { type: "number", description: "Max paths to return. Default 100." }
+          },
+          required: ["pattern"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "cache_set",
+        description: "Store a string value in the session cache under a key. Saved with the session JSON for resumed runs.",
+        parameters: {
+          type: "object",
+          properties: {
+            key:   { type: "string", description: "Cache key." },
+            value: { type: "string", description: "String value to store." }
+          },
+          required: ["key", "value"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "cache_get",
+        description: "Retrieve a value from the session cache by key. Returns the string value or 'null' if not set.",
+        parameters: {
+          type: "object",
+          properties: {
+            key: { type: "string", description: "Cache key to look up." }
+          },
+          required: ["key"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "path_exists",
+        description: "Check whether a workspace path exists. Returns JSON {exists, type}. Read-only.",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Workspace-relative path." }
+          },
+          required: ["path"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "is_text_file",
+        description: "Sniff first 512 bytes to determine whether a file is text or binary. Read-only.",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Workspace-relative file path." }
+          },
+          required: ["path"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "get_related_files",
+        description: "Scan a file for import/require/include statements and return the referenced module paths. Read-only.",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Workspace-relative file path." }
+          },
+          required: ["path"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "tree",
+        description: "Print a visual directory tree (like the 'tree' command). Skips common build/dep directories. Read-only.",
+        parameters: {
+          type: "object",
+          properties: {
+            path:      { type: "string", description: "Workspace-relative root. Defaults to workspace root." },
+            max_depth: { type: "number", description: "Maximum tree depth. Default 3, max 8." }
+          },
+          additionalProperties: false
+        }
+      }
+    }
+  );
 
   if (opts.permission === "review") return schemas;
 
@@ -636,6 +1633,35 @@ function toolSchemas(opts) {
             content: { type: "string", description: "Full file content to write." }
           },
           required: ["path", "content"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "patch_files",
+        description: "Apply multiple old_string→new_string replacements across one or more files atomically. All old_strings must match before any file is written. User is prompted unless full/auto-run mode.",
+        parameters: {
+          type: "object",
+          properties: {
+            edits: {
+              type: "array",
+              description: "List of edits to apply.",
+              items: {
+                type: "object",
+                properties: {
+                  path:        { type: "string",  description: "Workspace-relative file path." },
+                  old_string:  { type: "string",  description: "Exact text to find." },
+                  new_string:  { type: "string",  description: "Replacement text." },
+                  replace_all: { type: "boolean", description: "Replace every occurrence instead of just the first." }
+                },
+                required: ["path", "old_string", "new_string"],
+                additionalProperties: false
+              }
+            }
+          },
+          required: ["edits"],
           additionalProperties: false
         }
       }
@@ -686,6 +1712,43 @@ function toolSchemas(opts) {
             timeout_ms: { type: "number", description: "Timeout in milliseconds. Defaults to 60000." }
           },
           required: ["command"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "functions_shell_command",
+        description: "Execute a shell command in the workspace using PowerShell on Windows. Supports an optional workspace-relative working directory. Blocked in review permission mode. User is prompted unless full/auto-run mode.",
+        parameters: {
+          type: "object",
+          properties: {
+            command:    { type: "string", description: "Command to run." },
+            workdir:    { type: "string", description: "Workspace-relative working directory. Defaults to workspace root." },
+            timeout_ms: { type: "number", description: "Timeout in milliseconds. Defaults to 120000." }
+          },
+          required: ["command"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "handoff_start",
+        description: "Start a bounded delegated LLM handoff. Writes CLI output to a log file and rejects stale output files.",
+        parameters: {
+          type: "object",
+          properties: {
+            prompt_file: { type: "string", description: "Workspace-relative prompt file to read." },
+            output_file: { type: "string", description: "Workspace-relative output file expected from the handoff." },
+            log_file: { type: "string", description: "Workspace-relative log file for CLI stdout/stderr." },
+            cli: { type: "string", description: "CLI executable. Default claude." },
+            cli_args: { type: "string", description: "Optional CLI arguments, shell-like quoted string." },
+            timeout_seconds: { type: "number", description: "Timeout hint included in status output. Default 7200." }
+          },
+          required: ["prompt_file", "output_file", "log_file"],
           additionalProperties: false
         }
       }
@@ -798,10 +1861,10 @@ function askYesNo(question) {
   });
 }
 
-function runLocalCommand(exe, args, timeoutMs) {
+function runLocalCommand(exe, args, timeoutMs, cwd = process.cwd()) {
   return new Promise((resolvePromise) => {
     const child = spawn(exe, args, {
-      cwd: process.cwd(),
+      cwd,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"]
     });
@@ -833,7 +1896,7 @@ function runLocalCommand(exe, args, timeoutMs) {
   });
 }
 
-async function maybeRunShellTool(opts, shellName, command, timeoutMs) {
+async function maybeRunShellTool(opts, shellName, command, timeoutMs, cwd = process.cwd()) {
   const timeout = Math.min(Number(timeoutMs) || 60000, 600000);
   if (!command || typeof command !== "string") return "command error: command must be a non-empty string";
   if (opts.permission === "review") return "blocked by session permission: review only";
@@ -844,18 +1907,300 @@ async function maybeRunShellTool(opts, shellName, command, timeoutMs) {
     if (!ok) return "blocked by user";
   }
 
-  if (shellName === "cmd") return runLocalCommand("cmd.exe", ["/d", "/s", "/c", command], timeout);
-  return runLocalCommand("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command], timeout);
+  if (shellName === "cmd") return runLocalCommand("cmd.exe", ["/d", "/s", "/c", command], timeout, cwd);
+  return runLocalCommand("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command], timeout, cwd);
+}
+
+function activeSession(opts) {
+  if (!opts.sessionObject) throw new Error("No active session object.");
+  return opts.sessionObject;
+}
+
+function validatePlanItems(plan) {
+  if (!Array.isArray(plan)) throw new Error("plan must be an array.");
+  const allowed = new Set(["pending", "in_progress", "completed"]);
+  return plan.map((item, index) => {
+    const step = String(item?.step || "").trim();
+    const status = String(item?.status || "").trim();
+    if (!step) throw new Error(`plan[${index}].step must be non-empty.`);
+    if (!allowed.has(status)) throw new Error(`plan[${index}].status must be pending, in_progress, or completed.`);
+    return { step, status };
+  });
+}
+
+function planProgress(plan = []) {
+  const counts = { pending: 0, in_progress: 0, completed: 0, total: plan.length };
+  for (const item of plan) {
+    if (Object.prototype.hasOwnProperty.call(counts, item.status)) counts[item.status] += 1;
+  }
+  return counts;
+}
+
+async function pathExistsAbs(absPath) {
+  try {
+    await stat(absPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
+}
+
+async function readTail(absPath, tailLines) {
+  try {
+    const text = await readFile(absPath, "utf8");
+    const lines = text.split(/\r?\n/);
+    return lines.slice(-tailLines).join("\n");
+  } catch (error) {
+    if (error.code === "ENOENT") return "";
+    throw error;
+  }
+}
+
+function handoffCliArgs(cli, prompt, promptFile, cliArgs) {
+  const parsed = parseCommandLineArgs(cliArgs);
+  const lower = String(cli || "").toLowerCase();
+  if (lower.includes("claude")) return ["-p", prompt, ...parsed];
+  const hasPrompt = parsed.some((arg) => ["-p", "--prompt", "--prompt-file", "--stdin"].includes(arg));
+  if (hasPrompt) return parsed;
+  return ["--prompt-file", promptFile, ...parsed];
 }
 
 async function runTool(opts, name, args) {
   if (name === "get_runtime_context") return runtimeContext();
 
+  if (name === "create_goal") {
+    const session = activeSession(opts);
+    const objective = String(args.objective || "").trim();
+    if (!objective) throw new Error("objective must be non-empty.");
+    const budget = args.token_budget == null ? undefined : Number(args.token_budget);
+    if (budget !== undefined && (!Number.isFinite(budget) || budget <= 0)) throw new Error("token_budget must be positive when provided.");
+    const now = nowIso();
+    session.goal = {
+      objective,
+      status: "active",
+      ...(budget !== undefined ? { token_budget: budget } : {}),
+      createdAt: now,
+      updatedAt: now,
+      notes: []
+    };
+    return jsonResult(session.goal);
+  }
+
+  if (name === "get_goal") {
+    return jsonResult(activeSession(opts).goal || null);
+  }
+
+  if (name === "update_goal") {
+    const session = activeSession(opts);
+    if (!session.goal) throw new Error("No active goal. Use create_goal first.");
+    const status = String(args.status || "");
+    if (!["complete", "blocked"].includes(status)) throw new Error("status must be complete or blocked.");
+    const now = nowIso();
+    session.goal.status = status;
+    session.goal.updatedAt = now;
+    if (!Array.isArray(session.goal.notes)) session.goal.notes = [];
+    if (args.note) session.goal.notes.push({ at: now, note: String(args.note) });
+    return jsonResult(session.goal);
+  }
+
+  if (name === "update_plan") {
+    const session = activeSession(opts);
+    session.plan = validatePlanItems(args.plan);
+    if (args.explanation) {
+      session.planExplanation = String(args.explanation);
+      session.planUpdatedAt = nowIso();
+    }
+    return jsonResult({ plan: session.plan, explanation: session.planExplanation || "", progress: planProgress(session.plan) });
+  }
+
+  if (name === "get_plan") {
+    const session = activeSession(opts);
+    return jsonResult({ plan: session.plan || [], explanation: session.planExplanation || "", progress: planProgress(session.plan || []) });
+  }
+
+  if (name === "session_health") {
+    const session = activeSession(opts);
+    const repaired = repairToolCallHistory(session.messages || []);
+    return jsonResult({
+      version: session.version || null,
+      createdAt: session.createdAt || "",
+      updatedAt: session.updatedAt || "",
+      workspace: session.workspace || process.cwd(),
+      message_count: (session.messages || []).length,
+      non_system_message_count: (session.messages || []).filter((message) => message.role !== "system").length,
+      tool_history_repairs_needed: repaired.repairs,
+      touched_files: session.touchedFiles || [],
+      goal: session.goal || null,
+      plan_progress: planProgress(session.plan || []),
+      checkpoint_count: Array.isArray(session.checkpoints) ? session.checkpoints.length : 0,
+      latest_checkpoint: Array.isArray(session.checkpoints) && session.checkpoints.length ? session.checkpoints[session.checkpoints.length - 1] : null
+    });
+  }
+
+  if (name === "checkpoint_session") {
+    const session = activeSession(opts);
+    if (!Array.isArray(session.checkpoints)) session.checkpoints = [];
+    const checkpoint = {
+      label: String(args.label || `checkpoint ${session.checkpoints.length + 1}`),
+      summary: String(args.summary || finalAssistantContent(session) || "(no summary)"),
+      createdAt: nowIso()
+    };
+    session.checkpoints.push(checkpoint);
+    return jsonResult(checkpoint);
+  }
+
+  if (name === "summarize_session") {
+    const session = activeSession(opts);
+    const maxMessages = Math.min(Math.max(Number(args.max_messages) || 12, 1), 50);
+    const messages = (session.messages || []).filter((message) => message.role !== "system").slice(-maxMessages);
+    return [
+      `Session summary (${messages.length} recent messages)`,
+      session.goal ? `Goal: ${session.goal.objective} [${session.goal.status}]` : "Goal: none",
+      `Plan: ${planProgress(session.plan || []).completed}/${planProgress(session.plan || []).total} completed`,
+      "",
+      ...messages.map((message) => compactMessageForSummary(message))
+    ].join("\n");
+  }
+
+  if (name === "handoff_status") {
+    const outputPath = assertInsideWorkspace(args.output_file);
+    const logPath = args.log_file ? assertInsideWorkspace(args.log_file) : null;
+    const tailLines = Math.min(Math.max(Number(args.tail_lines) || 40, 1), 200);
+    const outputExists = await pathExistsAbs(outputPath);
+    const logExists = logPath ? await pathExistsAbs(logPath) : false;
+    const result = {
+      output_file: args.output_file,
+      output_exists: outputExists,
+      log_file: args.log_file || null,
+      log_exists: logExists,
+      output: outputExists ? compactText(await readFile(outputPath, "utf8"), 4000) : "",
+      log_tail: logExists ? await readTail(logPath, tailLines) : ""
+    };
+    return jsonResult(result);
+  }
+
+  if (name === "handoff_wait") {
+    const outputPath = assertInsideWorkspace(args.output_file);
+    const timeoutMs = Math.min(Math.max(Number(args.timeout_seconds) || 300, 1), 7200) * 1000;
+    const pollMs = Math.min(Math.max(Number(args.poll_ms) || 1000, 100), 30000);
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (await pathExistsAbs(outputPath)) {
+        if (args.print_content) return await readFile(outputPath, "utf8");
+        return `Handoff output ready: ${args.output_file}`;
+      }
+      await sleep(pollMs);
+    }
+    return `Timed out waiting for handoff output: ${args.output_file}`;
+  }
+
+  if (name === "handoff_start") {
+    if (opts.permission === "review") return "blocked by session permission: review only";
+    const promptPath = assertInsideWorkspace(args.prompt_file);
+    const outputPath = assertInsideWorkspace(args.output_file);
+    const logPath = assertInsideWorkspace(args.log_file);
+    const promptInfo = await stat(promptPath);
+    if (!promptInfo.isFile()) throw new Error("prompt_file is not a file.");
+    if (await pathExistsAbs(outputPath)) throw new Error("output_file already exists; remove it or choose a fresh output file.");
+    if (opts.permission !== "full" && !opts.dangerouslyAutoRunCommands) {
+      if (opts.noOutput) return "blocked by no-output mode";
+      const ok = await askYesNo(`Start handoff?\nPrompt: ${args.prompt_file}\nOutput: ${args.output_file}\nLog: ${args.log_file}`);
+      if (!ok) return "blocked by user";
+    }
+    await mkdir(dirname(logPath), { recursive: true });
+    const prompt = await readFile(promptPath, "utf8");
+    const cli = String(args.cli || "claude");
+    const childArgs = handoffCliArgs(cli, prompt, promptPath, args.cli_args);
+    await appendFile(logPath, `[${nowIso()}] starting ${cli} ${childArgs.map((arg) => JSON.stringify(arg)).join(" ")}\n`, "utf8");
+    const logFd = openSync(logPath, "a");
+    const child = spawn(cli, childArgs, {
+      cwd: process.cwd(),
+      detached: true,
+      windowsHide: true,
+      shell: process.platform === "win32",
+      stdio: ["ignore", logFd, logFd]
+    });
+    closeSync(logFd);
+    child.on("error", (error) => {
+      appendFile(logPath, `\n[${nowIso()}] spawn error: ${error.message}\n`, "utf8").catch(() => {});
+    });
+    child.unref();
+    return jsonResult({
+      started: true,
+      pid: child.pid,
+      cli,
+      output_file: args.output_file,
+      log_file: args.log_file,
+      timeout_seconds: Math.min(Math.max(Number(args.timeout_seconds) || 7200, 1), 7200)
+    });
+  }
+
   if (name === "list_workspace_files") {
+    const workspaceRoot = resolve(process.cwd());
     const target = assertInsideWorkspace(args.path || ".");
-    const max = Math.min(Number(args.max) || 80, 500);
-    const entries = await readdir(target, { withFileTypes: true });
-    return entries.slice(0, max).map((entry) => `${entry.isDirectory() ? "dir " : "file"} ${entry.name}`).join("\n");
+    const max = Math.min(Number(args.max) || 200, 2000);
+    const offset = Math.max(Number(args.offset) || 0, 0);
+    const typeFilter = args.type || "all";
+    const includeMetadata = args.include_metadata === true;
+    const globRx = args.glob ? globToRegex(args.glob) : null;
+    const excludeGlobRxs = args.exclude_glob ? [globToRegex(args.exclude_glob)] : [];
+    const userExcludes = Array.isArray(args.exclude_patterns) ? args.exclude_patterns : [];
+    const excludeDirNames = [...DEFAULT_TRAVERSE_EXCLUDES, ...userExcludes];
+
+    if (!args.recursive) {
+      const entries = await readdir(target, { withFileTypes: true });
+      let list = entries;
+      if (typeFilter === "file") list = list.filter((e) => e.isFile());
+      else if (typeFilter === "dir") list = list.filter((e) => e.isDirectory());
+      if (globRx) list = list.filter((e) => globRx.test(e.name));
+      const page = list.slice(offset, offset + max);
+      if (!includeMetadata) {
+        return page.map((e) => `${e.isDirectory() ? "dir " : "file"} ${e.name}`).join("\n");
+      }
+      const lines = [];
+      for (const e of page) {
+        try {
+          const info = await stat(join(target, e.name));
+          const size = e.isFile() ? ` ${info.size}B` : "";
+          const mtime = info.mtime.toISOString().slice(0, 19) + "Z";
+          lines.push(`${e.isDirectory() ? "dir " : "file"} ${e.name}${size} modified=${mtime}`);
+        } catch {
+          lines.push(`${e.isDirectory() ? "dir " : "file"} ${e.name}`);
+        }
+      }
+      return lines.join("\n");
+    }
+
+    const items = [];
+    for await (const item of walkDir(workspaceRoot, target, { excludeDirNames, excludeGlobRxs, type: typeFilter })) {
+      if (globRx && !globRx.test(item.relPath) && !globRx.test(item.relPath.split("/").pop())) continue;
+      items.push(item);
+    }
+    const page = items.slice(offset, offset + max);
+    const hasMore = items.length > offset + max;
+
+    if (!includeMetadata) {
+      const lines = page.map((item) => `${item.isDir ? "dir " : "file"} ${item.relPath}`);
+      if (hasMore) lines.push(`[${items.length - offset - max} more; use offset=${offset + max}]`);
+      return lines.join("\n");
+    }
+    const lines = [];
+    for (const item of page) {
+      try {
+        const info = await stat(item.absPath);
+        const size = !item.isDir ? ` ${info.size}B` : "";
+        const mtime = info.mtime.toISOString().slice(0, 19) + "Z";
+        lines.push(`${item.isDir ? "dir " : "file"} ${item.relPath}${size} modified=${mtime}`);
+      } catch {
+        lines.push(`${item.isDir ? "dir " : "file"} ${item.relPath}`);
+      }
+    }
+    if (hasMore) lines.push(`[${items.length - offset - max} more; use offset=${offset + max}]`);
+    return lines.join("\n");
   }
 
   if (name === "read_text_file") {
@@ -886,8 +2231,41 @@ async function runTool(opts, name, args) {
     const data = await readFile(target);
     const dataEnd = Math.min(offset + maxBytes, data.length);
     const chunk = data.subarray(offset, dataEnd).toString("utf8");
+    if (args.structured) {
+      return JSON.stringify({
+        content: chunk,
+        next_offset: dataEnd < data.length ? dataEnd : null,
+        total_bytes: data.length
+      });
+    }
     const more = dataEnd < data.length ? `\n\n[chunk ${offset}-${dataEnd} of ${data.length} bytes; continue with offset ${dataEnd}]` : "";
     return `${chunk}${more}`;
+  }
+
+  if (name === "web_search") {
+    return webSearch(args);
+  }
+
+  if (name === "web_fetch") {
+    return webFetch(args);
+  }
+
+  if (name === "view_image") {
+    return viewImage(args);
+  }
+
+  if (name === "list_skills") {
+    return formatSkillList(await discoverSkills(opts));
+  }
+
+  if (name === "read_skill") {
+    const skill = await resolveSkill(opts, args.name);
+    return [
+      `Skill: ${skill.name}`,
+      `Path: ${skill.path}`,
+      "",
+      skill.content
+    ].join("\n");
   }
 
   if (name === "write_text_file") {
@@ -937,6 +2315,240 @@ async function runTool(opts, name, args) {
     return maybeRunShellTool(opts, "powershell", args.command, args.timeout_ms);
   }
 
+  if (name === "functions_shell_command" || name === "functions.shell_command") {
+    const cwd = args.workdir ? assertInsideWorkspace(args.workdir) : resolve(process.cwd());
+    return maybeRunShellTool(opts, "powershell", args.command, args.timeout_ms ?? 120000, cwd);
+  }
+
+  if (name === "search_code") {
+    const pattern = String(args.pattern || "");
+    if (!pattern) throw new Error("pattern is required");
+    let searchRe;
+    try { searchRe = new RegExp(pattern, args.ignore_case ? "i" : ""); }
+    catch { searchRe = new RegExp(escapeRegex(pattern), args.ignore_case ? "i" : ""); }
+    const workspaceRoot = resolve(process.cwd());
+    const searchRoot = args.path ? assertInsideWorkspace(args.path) : workspaceRoot;
+    const maxResults = Math.min(Number(args.max_results) || 200, 1000);
+    const contextLines = Math.min(Math.max(Number(args.context_lines) || 0, 0), 5);
+    const globRx = args.glob ? globToRegex(args.glob) : null;
+    const userExcludes = Array.isArray(args.exclude_patterns) ? args.exclude_patterns : [];
+    const excludeDirNames = args.respect_gitignore === false
+      ? userExcludes
+      : [...DEFAULT_TRAVERSE_EXCLUDES, ...userExcludes];
+    const results = [];
+    outer: for await (const item of walkDir(workspaceRoot, searchRoot, { excludeDirNames, type: "file" })) {
+      if (globRx && !globRx.test(item.relPath) && !globRx.test(item.relPath.split("/").pop())) continue;
+      if (await isBinaryFile(item.absPath)) continue;
+      let text;
+      try { text = await readFile(item.absPath, "utf8"); } catch { continue; }
+      const lines = text.split("\n");
+      for (let i = 0; i < lines.length; i++) {
+        if (searchRe.test(lines[i])) {
+          const s = Math.max(0, i - contextLines);
+          const e = Math.min(lines.length - 1, i + contextLines);
+          const snippet = lines.slice(s, e + 1).map((line, off) => {
+            const ln = s + off + 1;
+            const mark = s + off === i ? ">" : " ";
+            return `${mark}${String(ln).padStart(5)}: ${line}`;
+          }).join("\n");
+          results.push(`${item.relPath}:${i + 1}\n${snippet}`);
+          if (results.length >= maxResults) break outer;
+        }
+      }
+    }
+    if (!results.length) return `No matches for: ${pattern}`;
+    const sep = "\n" + "─".repeat(60) + "\n";
+    return results.join(sep) + (results.length >= maxResults ? `\n[capped at ${maxResults} results]` : "");
+  }
+
+  if (name === "read_text_files") {
+    const files = Array.isArray(args.files) ? args.files : [];
+    if (!files.length) return JSON.stringify({});
+    const result = {};
+    await Promise.all(files.map(async (spec) => {
+      const filePath = typeof spec === "string" ? spec : spec?.path;
+      if (!filePath) return;
+      try {
+        const target = assertInsideWorkspace(filePath);
+        const info = await stat(target);
+        if (!info.isFile()) { result[filePath] = { error: "not a file" }; return; }
+        if (spec.start_line != null) {
+          const text = await readFile(target, "utf8");
+          const lines = text.split("\n");
+          const total = lines.length;
+          const start = Math.max(1, Number(spec.start_line));
+          const end = spec.end_line != null ? Math.min(Number(spec.end_line), total) : Math.min(start + 99, total);
+          result[filePath] = `[lines ${start}–${end} of ${total}]\n${lines.slice(start - 1, end).join("\n")}`;
+        } else {
+          const maxBytes = Math.min(Number(spec.max_bytes) || 20000, 200000);
+          const data = await readFile(target);
+          result[filePath] = data.subarray(0, maxBytes).toString("utf8");
+        }
+      } catch (e) {
+        result[filePath] = { error: e.message };
+      }
+    }));
+    return JSON.stringify(result, null, 2);
+  }
+
+  if (name === "git_status") {
+    const gitArgs = ["status", "--short", "--branch"];
+    if (args.path) gitArgs.push("--", assertInsideWorkspace(args.path));
+    const r = await runGit(gitArgs);
+    return r.out.trim() || r.err.trim() || "clean";
+  }
+
+  if (name === "git_diff") {
+    const gitArgs = ["diff"];
+    if (args.staged) gitArgs.push("--staged");
+    if (args.target_branch) gitArgs.push(String(args.target_branch));
+    if (args.path) gitArgs.push("--", assertInsideWorkspace(args.path));
+    const r = await runGit(gitArgs);
+    return r.out || "(no diff)";
+  }
+
+  if (name === "git_log") {
+    const max = Math.min(Number(args.max_entries) || 20, 100);
+    const gitArgs = ["log", `--max-count=${max}`, "--oneline", "--decorate"];
+    if (args.path) gitArgs.push("--", assertInsideWorkspace(args.path));
+    const r = await runGit(gitArgs);
+    return r.out.trim() || "(no commits)";
+  }
+
+  if (name === "git_blame") {
+    const target = assertInsideWorkspace(args.file_path);
+    const gitArgs = ["blame"];
+    if (args.start_line != null && args.end_line != null) {
+      gitArgs.push("-L", `${args.start_line},${args.end_line}`);
+    } else if (args.start_line != null) {
+      gitArgs.push("-L", `${args.start_line},${args.start_line}`);
+    }
+    gitArgs.push(target);
+    const r = await runGit(gitArgs);
+    return r.out || r.err || "(no output)";
+  }
+
+  if (name === "stat_file") {
+    const target = assertInsideWorkspace(args.path);
+    const info = await stat(target);
+    const type = info.isDirectory() ? "dir" : info.isFile() ? "file" : "other";
+    const is_binary = info.isFile() ? await isBinaryFile(target) : false;
+    return JSON.stringify({ path: args.path, type, size_bytes: info.size, modified_iso: info.mtime.toISOString(), is_binary }, null, 2);
+  }
+
+  if (name === "patch_files") {
+    if (opts.permission === "review") return "blocked by session permission: review only";
+    const edits = Array.isArray(args.edits) ? args.edits : [];
+    if (!edits.length) return "No edits provided.";
+    const preflights = await Promise.all(edits.map(async (edit) => {
+      try {
+        const target = assertInsideWorkspace(edit.path);
+        const info = await stat(target);
+        if (!info.isFile()) return { edit, ok: false, error: "not a file", target: null, content: null };
+        const content = await readFile(target, "utf8");
+        if (!content.includes(edit.old_string)) return { edit, ok: false, error: "old_string not found", target, content };
+        return { edit, ok: true, error: null, target, content };
+      } catch (e) {
+        return { edit, ok: false, error: e.message, target: null, content: null };
+      }
+    }));
+    const failures = preflights.filter((p) => !p.ok);
+    if (failures.length) {
+      return `Preflight failed — no files written:\n${failures.map((f) => `  ${f.edit.path}: ${f.error}`).join("\n")}`;
+    }
+    if (opts.permission !== "full" && !opts.dangerouslyAutoRunCommands) {
+      if (opts.noOutput) return "blocked by no-output mode";
+      const preview = edits.map((e) => `  ${e.path}: ${e.old_string.slice(0, 60)}${e.old_string.length > 60 ? "…" : ""}`).join("\n");
+      const ok = await askYesNo(`Patch ${edits.length} file${edits.length !== 1 ? "s" : ""}?\n${preview}`);
+      if (!ok) return "blocked by user";
+    }
+    const written = [];
+    for (const { edit, content, target } of preflights) {
+      const newContent = edit.replace_all
+        ? content.split(edit.old_string).join(edit.new_string)
+        : content.replace(edit.old_string, edit.new_string);
+      await atomicWriteFile(target, newContent);
+      opts.touchedFiles?.add(edit.path);
+      written.push(`  ${edit.path}`);
+    }
+    return `Patched ${written.length} file${written.length !== 1 ? "s" : ""}:\n${written.join("\n")}`;
+  }
+
+  if (name === "cache_set") {
+    if (!opts.sessionCache) opts.sessionCache = {};
+    opts.sessionCache[String(args.key)] = String(args.value);
+    return `Cached key: ${args.key}`;
+  }
+
+  if (name === "cache_get") {
+    const val = opts.sessionCache?.[String(args.key)];
+    return val !== undefined ? val : "null";
+  }
+
+  if (name === "glob") {
+    const pattern = String(args.pattern || "");
+    if (!pattern) throw new Error("pattern is required");
+    const max = Math.min(Number(args.max) || 100, 1000);
+    const workspaceRoot = resolve(process.cwd());
+    const globRx = globToRegex(pattern);
+    const results = [];
+    for await (const item of walkDir(workspaceRoot, workspaceRoot, { excludeDirNames: DEFAULT_TRAVERSE_EXCLUDES })) {
+      if (globRx.test(item.relPath)) {
+        results.push(item.relPath);
+        if (results.length >= max) break;
+      }
+    }
+    return results.join("\n") || "(no matches)";
+  }
+
+  if (name === "path_exists") {
+    const target = assertInsideWorkspace(args.path);
+    try {
+      const info = await stat(target);
+      return JSON.stringify({ exists: true, type: info.isDirectory() ? "dir" : "file" });
+    } catch {
+      return JSON.stringify({ exists: false });
+    }
+  }
+
+  if (name === "is_text_file") {
+    const target = assertInsideWorkspace(args.path);
+    try {
+      const info = await stat(target);
+      if (!info.isFile()) return JSON.stringify({ is_text: false, reason: "not a file" });
+      const binary = await isBinaryFile(target);
+      return JSON.stringify({ is_text: !binary });
+    } catch (e) {
+      return JSON.stringify({ error: e.message });
+    }
+  }
+
+  if (name === "get_related_files") {
+    const target = assertInsideWorkspace(args.path);
+    const text = await readFile(target, "utf8");
+    const importPatterns = [
+      /import\s+(?:[\w*{},\s]+from\s+)?['"]([^'"]+)['"]/g,
+      /require\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
+      /#include\s+[<"]([^>"]+)[>"]/g,
+      /from\s+['"]([^'"]+)['"]/g
+    ];
+    const refs = new Set();
+    for (const pattern of importPatterns) {
+      for (const match of text.matchAll(pattern)) refs.add(match[1]);
+    }
+    return [...refs].join("\n") || "(no imports found)";
+  }
+
+  if (name === "tree") {
+    const target = assertInsideWorkspace(args.path || ".");
+    const maxDepth = Math.min(Number(args.max_depth) || 3, 8);
+    const relLabel = relative(process.cwd(), target).replace(/\\/g, "/") || ".";
+    const lines = [`${relLabel}/`];
+    const sub = await buildTreeLines(target, "", 0, maxDepth);
+    lines.push(...sub);
+    return lines.join("\n");
+  }
+
   throw new Error(`Unknown tool: ${name}`);
 }
 
@@ -970,7 +2582,55 @@ async function executeToolCall(opts, call) {
 function shouldRunToolsSequentially(opts, calls) {
   if (opts.toolMode === "sequential") return true;
   if (opts.dangerouslyAutoRunCommands) return false;
-  return calls.some((call) => ["run_cmd", "run_powershell"].includes(call.function?.name));
+  return calls.some((call) => ["run_cmd", "run_powershell", "functions_shell_command", "functions.shell_command"].includes(call.function?.name));
+}
+
+function repairToolCallHistory(messages) {
+  const repaired = [];
+  let repairs = 0;
+
+  for (let i = 0; i < (messages || []).length; i += 1) {
+    const message = messages[i];
+    if (message.role === "tool") {
+      repairs += 1;
+      continue;
+    }
+
+    repaired.push(message);
+    const calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+    if (message.role !== "assistant" || calls.length === 0) continue;
+
+    const missing = new Map();
+    calls.forEach((call, index) => {
+      const id = call.id || `missing_tool_call_${index}`;
+      missing.set(id, call.function?.name || "tool");
+    });
+
+    let j = i + 1;
+    while (j < messages.length && messages[j].role === "tool") {
+      const toolMessage = messages[j];
+      if (missing.has(toolMessage.tool_call_id)) {
+        repaired.push(toolMessage);
+        missing.delete(toolMessage.tool_call_id);
+      } else {
+        repairs += 1;
+      }
+      j += 1;
+    }
+
+    for (const [toolCallId, toolName] of missing) {
+      repaired.push({
+        role: "tool",
+        tool_call_id: toolCallId,
+        content: `Tool result unavailable: previous session ended before ${toolName} completed.`
+      });
+      repairs += 1;
+    }
+
+    i = j - 1;
+  }
+
+  return { messages: repaired, repairs };
 }
 
 async function streamChat(opts, messages) {
@@ -983,29 +2643,7 @@ async function streamChat(opts, messages) {
   let content = "";
   let reasoningContent = "";
   let phase = "";
-  let interrupted = false;
-  let cleanupInterrupt = () => {};
-
   try {
-    if (opts.interactiveChat && process.stdin.isTTY) {
-      const stdin = process.stdin;
-      const onData = (chunk) => {
-        if (chunk.toString("utf8") === "\u001b") {
-          interrupted = true;
-          process.stdout.write(`\n${red(opts, `${ICONS.warn} interrupted`)}\n`);
-          controller.abort();
-        }
-      };
-      stdin.resume();
-      stdin.setRawMode(true);
-      stdin.on("data", onData);
-      cleanupInterrupt = () => {
-        stdin.setRawMode(false);
-        stdin.pause();
-        stdin.removeListener("data", onData);
-      };
-    }
-
     const body = {
       model: opts.model,
       messages,
@@ -1065,19 +2703,8 @@ async function streamChat(opts, messages) {
 
     if (!opts.noOutput) process.stdout.write("\n");
     return { role: "assistant", content, reasoning_content: reasoningContent, tool_calls: toolCalls.length ? toolCalls : undefined };
-  } catch (error) {
-    if (interrupted) {
-      return { role: "assistant", content: "[interrupted by user]", reasoning_content: reasoningContent };
-    }
-    throw error;
   } finally {
-    cleanupInterrupt();
     clearTimeout(timer);
-    // Drain any buffered keystrokes (e.g. leftover escape sequence bytes) so
-    // the next promptLine() doesn't inherit stale raw-mode input.
-    if (process.stdin.isTTY) {
-      try { while (process.stdin.read() !== null) {} } catch {}
-    }
   }
 }
 
@@ -1101,6 +2728,7 @@ async function processAgentTurns(opts, session) {
       writeToolResult(opts, toolDisplayResult(execution.name, execution.args, execution.result));
       session.messages.push({ role: "tool", tool_call_id: execution.call.id, content: String(execution.result) });
       session.touchedFiles = [...(opts.touchedFiles || [])];
+      session.cache = { ...(opts.sessionCache || {}) };
       if (opts.saveSession) await writeSession(opts.session, touchSession(session));
     }
   }
@@ -1137,6 +2765,28 @@ async function run() {
     return;
   }
 
+  if (opts.listSkills) {
+    process.stdout.write(`${formatSkillList(await discoverSkills(opts))}\n`);
+    return;
+  }
+
+  let resumedSession = null;
+  if (!opts.session && opts.resume) {
+    opts.session = await pickSession(opts);
+  }
+  if (opts.resume) {
+    resumedSession = await readSession(opts.session);
+    if (!opts.skills.length && Array.isArray(resumedSession.config?.skills)) {
+      opts.skills = normalizeList(resumedSession.config.skills);
+    }
+    if (!opts.skillRoots.length && Array.isArray(resumedSession.config?.skillRoots)) {
+      opts.skillRoots = normalizeList(resumedSession.config.skillRoots);
+    }
+  }
+
+  opts.skills = normalizeList(opts.skills);
+  opts.skillRoots = normalizeList(opts.skillRoots);
+
   const systemPrompt = await loadSystemPrompt(opts);
   if (opts.printSystem) {
     process.stdout.write(`${systemPrompt}\n`);
@@ -1145,11 +2795,11 @@ async function run() {
 
   const userPrompt = await loadPrompt(opts);
   if (!opts.session) {
-    opts.session = opts.resume ? await pickSession(opts) : newSessionPath();
+    opts.session = newSessionPath();
   }
 
   const session = opts.resume
-    ? await readSession(opts.session)
+    ? resumedSession
     : newSession({
       model: opts.model,
       baseUrl: opts.baseUrl,
@@ -1158,15 +2808,37 @@ async function run() {
       userPrompt,
       config: {
         permission: opts.permission || (opts.dangerouslyAutoRunCommands ? "full" : "ask"),
-        toolMode: opts.toolMode
+        toolMode: opts.toolMode,
+        skills: opts.skills,
+        skillRoots: opts.skillRoots
       }
     });
+
+  if (opts.resume && (opts.skills.length || opts.skillRoots.length)) {
+    updateSystemMessage(session, systemPrompt);
+  }
+
+  const repairedHistory = repairToolCallHistory(session.messages);
+  if (repairedHistory.repairs > 0) {
+    session.messages = repairedHistory.messages;
+    if (!opts.noOutput) {
+      process.stderr.write(`Repaired ${repairedHistory.repairs} invalid saved tool message${repairedHistory.repairs === 1 ? "" : "s"} before resume.\n`);
+    }
+  }
 
   opts.permission = opts.permission || session.config?.permission || (opts.dangerouslyAutoRunCommands ? "full" : "ask");
   opts.toolMode = opts.toolMode || session.config?.toolMode || "parallel";
   if (opts.permission === "full") opts.dangerouslyAutoRunCommands = true;
-  session.config = { ...(session.config || {}), permission: opts.permission, toolMode: opts.toolMode };
+  session.config = {
+    ...(session.config || {}),
+    permission: opts.permission,
+    toolMode: opts.toolMode,
+    skills: opts.skills,
+    skillRoots: opts.skillRoots
+  };
   opts.touchedFiles = new Set(session.touchedFiles || []);
+  opts.sessionCache = { ...(session.cache || {}) };
+  opts.sessionObject = session;
 
   if (opts.resume) {
     session.messages.push({ role: "user", content: userPrompt });
@@ -1179,20 +2851,20 @@ async function run() {
 
   await processAgentTurns(opts, session);
   session.touchedFiles = [...opts.touchedFiles];
+  session.cache = { ...(opts.sessionCache || {}) };
   if (opts.saveSession) await writeSession(opts.session, touchSession(session));
   await maybeWriteOutput(opts, session);
 
   while (opts.interactiveChat) {
-    process.stdout.write(`
-  ${dim(opts, "esc clear  ·  ctrl+c exit")}
-`);
-    const nextPrompt = await promptLine("  ❯ ");
+    process.stdout.write(`\n  ${dim(opts, "Enter to send, /exit to quit, Ctrl+C to exit")}\n`);
+    const nextPrompt = await promptLine("  > ");
     if (!nextPrompt.trim()) continue;
     if (isExitCommand(nextPrompt)) return;
     session.messages.push({ role: "user", content: nextPrompt });
     if (opts.saveSession) await writeSession(opts.session, touchSession(session));
     await processAgentTurns(opts, session);
     session.touchedFiles = [...opts.touchedFiles];
+    session.cache = { ...(opts.sessionCache || {}) };
     if (opts.saveSession) await writeSession(opts.session, touchSession(session));
     await maybeWriteOutput(opts, session);
   }

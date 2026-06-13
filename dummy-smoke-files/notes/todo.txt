@@ -1,0 +1,9 @@
+Smoke test notes
+
+1. Use search_code to find SMOKE_TARGET.
+2. Use read_text_files on src/app.js and src/util.js.
+3. Use patch_files to replace PATCH_ME with PATCHED.
+4. Use stat_file and path_exists on this file.
+
+SMOKE_TARGET notes
+

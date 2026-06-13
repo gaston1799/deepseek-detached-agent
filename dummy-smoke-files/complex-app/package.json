@@ -1,0 +1,11 @@
+{
+  "name": "complex-smoke-app",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/main.js",
+    "test": "node tests/run.js"
+  },
+  "description": "Fake service for testing DeepSeek tools"
+}
