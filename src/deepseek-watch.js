@@ -919,14 +919,79 @@ async function viewImage(args) {
     mime,
     size_bytes: info.size,
     dimensions,
+    vision_available: false,
+    note: "This tool does not visually interpret image content. Use analyze_image_openai for real image understanding when OPENAI_API_KEY is configured.",
     data_url_included: includeData && buffer.length <= maxBytes
   };
   if (includeData && buffer.length <= maxBytes) {
     result.data_url = `data:${mime};base64,${buffer.toString("base64")}`;
   } else if (includeData) {
-    result.note = `Image is ${buffer.length} bytes, above max_bytes=${maxBytes}; raise max_bytes or set include_data_url=false for metadata only.`;
+    result.data_url_note = `Image is ${buffer.length} bytes, above max_bytes=${maxBytes}; raise max_bytes or set include_data_url=false for metadata only.`;
   }
   return JSON.stringify(result, null, 2);
+}
+
+function extractOpenAiOutputText(data) {
+  if (typeof data.output_text === "string" && data.output_text.trim()) return data.output_text.trim();
+  const chunks = [];
+  for (const item of data.output || []) {
+    for (const content of item.content || []) {
+      if (typeof content.text === "string") chunks.push(content.text);
+      if (typeof content.output_text === "string") chunks.push(content.output_text);
+    }
+  }
+  return chunks.join("\n").trim();
+}
+
+async function analyzeImageOpenAI(args) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error("OPENAI_API_KEY is not set. Create an OpenAI API key, then set $env:OPENAI_API_KEY before running d/dsw.");
+
+  const target = assertInsideWorkspace(args.path);
+  const info = await stat(target);
+  if (!info.isFile()) throw new Error("Path is not a file.");
+  const mime = imageMime(args.path);
+  if (!mime.startsWith("image/")) throw new Error(`Unsupported image extension: ${extname(args.path) || "(none)"}`);
+  const buffer = await readFile(target);
+  const maxBytes = Math.min(Math.max(Number(args.max_bytes) || 12000000, 1), 20000000);
+  if (buffer.length > maxBytes) {
+    throw new Error(`Image is ${buffer.length} bytes, above max_bytes=${maxBytes}. Crop/compress it or raise max_bytes.`);
+  }
+
+  const prompt = String(args.prompt || "Describe the image precisely. If it contains text or code, transcribe it exactly before summarizing.").trim();
+  const model = String(args.model || process.env.OPENAI_VISION_MODEL || "gpt-4.1-mini").trim();
+  const maxOutputTokens = Math.min(Math.max(Number(args.max_output_tokens) || 1200, 100), 8000);
+  const dataUrl = `data:${mime};base64,${buffer.toString("base64")}`;
+  const response = await fetchWithTimeout("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model,
+      max_output_tokens: maxOutputTokens,
+      input: [
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: prompt },
+            { type: "input_image", image_url: dataUrl }
+          ]
+        }
+      ]
+    })
+  }, Math.min(Number(args.timeout_ms) || 60000, 180000));
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`OpenAI vision request failed: HTTP ${response.status}${text ? ` ${compactText(text, 800)}` : ""}`);
+  }
+
+  const data = await response.json();
+  const output = extractOpenAiOutputText(data);
+  if (!output) return JSON.stringify({ path: args.path, model, output: "", raw_status: data.status || null }, null, 2);
+  return output;
 }
 
 function compactText(value, max = 900) {
@@ -1159,13 +1224,33 @@ function toolSchemas(opts) {
       type: "function",
       function: {
         name: "view_image",
-        description: "Read a workspace image file and return JSON metadata, dimensions when detectable, and a base64 data URL when small enough. Read-only.",
+        description: "Read a workspace image file and return JSON metadata, dimensions when detectable, and a base64 data URL when small enough. Does not visually interpret content. Read-only.",
         parameters: {
           type: "object",
           properties: {
             path: { type: "string", description: "Workspace-relative image path." },
             include_data_url: { type: "boolean", description: "Include a data:image/... base64 URL. Default true." },
             max_bytes: { type: "number", description: "Maximum image bytes to include in data_url. Default 4000000, max 12000000." }
+          },
+          required: ["path"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "analyze_image_openai",
+        description: "Use OpenAI vision to visually inspect a workspace image and return text analysis or exact transcription. Requires OPENAI_API_KEY. Read-only.",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Workspace-relative image path." },
+            prompt: { type: "string", description: "Vision prompt. For screenshots/code, ask to transcribe text exactly before summarizing." },
+            model: { type: "string", description: "OpenAI vision-capable model. Defaults to OPENAI_VISION_MODEL or gpt-4.1-mini." },
+            max_output_tokens: { type: "number", description: "Maximum OpenAI output tokens. Default 1200, max 8000." },
+            max_bytes: { type: "number", description: "Maximum image bytes to send. Default 12000000, max 20000000." },
+            timeout_ms: { type: "number", description: "OpenAI request timeout. Default 60000, max 180000." }
           },
           required: ["path"],
           additionalProperties: false
@@ -2252,6 +2337,10 @@ async function runTool(opts, name, args) {
 
   if (name === "view_image") {
     return viewImage(args);
+  }
+
+  if (name === "analyze_image_openai") {
+    return analyzeImageOpenAI(args);
   }
 
   if (name === "list_skills") {

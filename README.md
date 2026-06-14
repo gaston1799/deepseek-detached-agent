@@ -98,7 +98,8 @@ dsw --permission full   -p "refactor utils.js to use ES modules"
 | `list_workspace_files` | List files/dirs — now supports `recursive`, `glob`, `exclude_glob`, `include_metadata`, pagination |
 | `read_text_file` | Read a file by line range or byte offset; `structured: true` returns cursor JSON |
 | `read_text_files` | Batch-read multiple files in one call; per-file errors don't abort the batch |
-| `view_image` | Read a workspace image and return metadata, dimensions, and a data URL when small enough |
+| `view_image` | Read a workspace image and return metadata, dimensions, and a data URL when small enough; does not visually interpret content |
+| `analyze_image_openai` | Use OpenAI vision to inspect/transcribe a workspace image; requires `OPENAI_API_KEY` |
 | `search_code` | Regex/literal search across workspace files with glob filter and context lines |
 | `glob` | Discover paths matching a glob pattern (no shell) |
 | `stat_file` | Size, modification time, type, and binary flag for any path |
@@ -225,6 +226,21 @@ dsw --resume --skill pbc -p "continue"
 ```
 
 Future resumes of that session reuse the saved skills automatically unless you pass a different `--skill` / `--skills` set.
+
+### Image understanding
+
+`view_image` only exposes image metadata and a data URL. For real visual understanding, set an OpenAI key and let DeepSeek call `analyze_image_openai`:
+
+```powershell
+$env:OPENAI_API_KEY = "sk-..."
+d -p "read the code in screenshot.png" --permission review
+```
+
+Use `OPENAI_VISION_MODEL` to override the default OpenAI vision model:
+
+```powershell
+$env:OPENAI_VISION_MODEL = "gpt-4.1-mini"
+```
 
 Quiet outfile mode is meant for detached subagent workflows where console text costs tokens:
 
