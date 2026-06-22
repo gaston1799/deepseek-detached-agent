@@ -198,35 +198,50 @@ async function discoverSkills(opts = {}) {
   const roots = defaultSkillRoots(opts);
   const skills = [];
   const seen = new Set();
-  for (const root of roots) {
+
+  async function addSkill(root, folder, skillFile) {
+    let text;
+    try {
+      text = await readFile(skillFile, "utf8");
+    } catch {
+      return;
+    }
+    const meta = parseSkillFrontmatter(text, folder);
+    const key = `${meta.name}\0${skillFile}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    skills.push({
+      name: meta.name,
+      folder,
+      description: meta.description,
+      root,
+      path: skillFile
+    });
+  }
+
+  async function scanRoot(root, includeHiddenGroups = true) {
     let entries;
     try {
       entries = await readdir(root, { withFileTypes: true });
     } catch {
-      continue;
+      return;
     }
     for (const entry of entries) {
-      if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
-      const skillFile = join(root, entry.name, "SKILL.md");
-      let text;
-      try {
-        text = await readFile(skillFile, "utf8");
-      } catch {
+      if (!entry.isDirectory()) continue;
+      if (entry.name.startsWith(".")) {
+        if (includeHiddenGroups) await scanRoot(join(root, entry.name), false);
         continue;
       }
-      const meta = parseSkillFrontmatter(text, entry.name);
-      const key = `${meta.name}\0${skillFile}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      skills.push({
-        name: meta.name,
-        folder: entry.name,
-        description: meta.description,
-        root,
-        path: skillFile
-      });
+
+      const skillFile = join(root, entry.name, "SKILL.md");
+      await addSkill(root, entry.name, skillFile);
     }
   }
+
+  for (const root of roots) {
+    await scanRoot(root);
+  }
+
   return skills.sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
 }
 

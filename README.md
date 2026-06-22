@@ -215,7 +215,7 @@ Skill discovery checks, in order:
 - directories passed with `--skill-root`
 - directories from `DEEPSEEK_SKILLS_DIR` (path-delimited)
 - `.deepseek-watch/skills` in the current workspace
-- `~/.codex/skills`
+- `~/.codex/skills`, including Codex hidden grouping folders such as `.system`
 
 Use `--list-skills` to see discovered skills. During a session, DeepSeek can also call `list_skills` and `read_skill` to inspect skills that were not preloaded.
 
