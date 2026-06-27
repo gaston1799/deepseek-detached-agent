@@ -1097,6 +1097,10 @@ async function pickDashboardAction(opts) {
 
 function promptLine(question) {
   return new Promise((resolve) => {
+    if (process.stdin.isTTY && typeof process.stdin.setRawMode === "function") {
+      try { process.stdin.setRawMode(false); } catch {}
+    }
+    process.stdin.resume();
     const rl = createInterface({ input: process.stdin, output: process.stdout });
     rl.on("SIGINT", () => {
       rl.close();
@@ -2752,8 +2756,6 @@ function installStreamInterruptHandler(opts, controller) {
   }
 
   const stdin = process.stdin;
-  const wasRaw = Boolean(stdin.isRaw);
-  const wasPaused = stdin.isPaused();
   const onData = (chunk) => {
     const text = chunk.toString("utf8");
     if (text === "\u001b" || text === "\u0003") {
@@ -2769,9 +2771,8 @@ function installStreamInterruptHandler(opts, controller) {
 
   return () => {
     stdin.off("data", onData);
-    try { stdin.setRawMode(wasRaw); } catch {}
-    if (wasPaused) stdin.pause();
-    try { while (stdin.read() !== null) {} } catch {}
+    try { stdin.setRawMode(false); } catch {}
+    stdin.resume();
   };
 }
 
