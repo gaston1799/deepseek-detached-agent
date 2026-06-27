@@ -119,6 +119,8 @@ The UI delegates chat execution back to the existing `d` CLI and writes run outp
 
 ## Workspace tools
 
+In terminals that support OSC-8 hyperlinks, the TUI turns exact workspace file paths shown in tool calls/results into clickable file links. Set `DEEPSEEK_NO_FILE_LINKS=1` to disable terminal file links.
+
 ### Read-only (all permission levels)
 
 | Tool | Description |

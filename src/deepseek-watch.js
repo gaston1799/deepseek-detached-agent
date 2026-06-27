@@ -5,7 +5,7 @@ import { platform, release, arch, userInfo, homedir } from "node:os";
 import { dirname, extname, isAbsolute, join, resolve, relative, delimiter } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { clearLine, createInterface, cursorTo } from "node:readline";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { deepSeekHttpError } from "./api-error.js";
 import { configPath, getDeepSeekApiKey, setDeepSeekApiKey } from "./config.js";
 import { applyThinkingOptions } from "./deepseek-request.js";
@@ -403,6 +403,57 @@ function bold(opts, text) {
   return color(opts, "1", text);
 }
 
+function supportsTerminalLinks(opts) {
+  return !opts.noOutput && process.stdout.isTTY && process.env.DEEPSEEK_NO_FILE_LINKS !== "1";
+}
+
+function terminalLink(opts, text, target) {
+  if (!supportsTerminalLinks(opts)) return text;
+  return `\x1b]8;;${target}\x1b\\${text}\x1b]8;;\x1b\\`;
+}
+
+function workspaceFileLink(opts, relPath, display = relPath) {
+  const text = String(display || relPath || "");
+  if (!text) return text;
+  try {
+    const abs = assertInsideWorkspace(String(relPath));
+    return terminalLink(opts, text, pathToFileURL(abs).href);
+  } catch {
+    return text;
+  }
+}
+
+function collectPathLikeValues(value, out = new Set()) {
+  if (Array.isArray(value)) {
+    for (const item of value) collectPathLikeValues(item, out);
+    return out;
+  }
+  if (!value || typeof value !== "object") return out;
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item === "string" && /(^|_)(path|file)$|^(path|file_path|prompt_file|output_file|log_file)$/i.test(key)) {
+      out.add(item);
+    } else {
+      collectPathLikeValues(item, out);
+    }
+  }
+  return out;
+}
+
+function applyKnownFileLinks(opts, text, paths) {
+  if (!supportsTerminalLinks(opts)) return text;
+  let linked = String(text || "");
+  const known = [...paths].filter(Boolean).sort((a, b) => String(b).length - String(a).length);
+  for (const value of known) {
+    const pathText = String(value);
+    linked = linked.replace(new RegExp(escapeRegex(pathText), "g"), workspaceFileLink(opts, pathText));
+    if (pathText.includes("\\")) {
+      const jsonEscapedPath = pathText.replace(/\\/g, "\\\\");
+      linked = linked.replace(new RegExp(escapeRegex(jsonEscapedPath), "g"), workspaceFileLink(opts, pathText, jsonEscapedPath));
+    }
+  }
+  return linked;
+}
+
 function estimateTokens(text) {
   return Math.max(0, Math.ceil(String(text || "").length / 4));
 }
@@ -635,7 +686,7 @@ function heading(opts, text, kind = "info") {
 
 function writeSessionNotice(opts, path) {
   if (opts.noOutput) return;
-  process.stderr.write(`  ${color(opts, "2;35", `${ICONS.session} session`)}  ${dim(opts, path)}\n`);
+  process.stderr.write(`  ${color(opts, "2;35", `${ICONS.session} session`)}  ${dim(opts, terminalLink(opts, path, pathToFileURL(resolve(path)).href))}\n`);
 }
 
 function compactDisplayString(value, max = 700) {
@@ -674,16 +725,22 @@ function formatJsonish(raw, name = "") {
 function writeToolCall(opts, name, rawArgs) {
   if (opts.noOutput) return;
   process.stdout.write(`  ${yellow(opts, "▹")} ${bold(opts, name)}\n`);
-  process.stdout.write(`${dim(opts, formatJsonish(rawArgs, name)).split("\n").map((line) => `    ${line}`).join("\n")}\n`);
+  let display = formatJsonish(rawArgs, name);
+  try {
+    display = applyKnownFileLinks(opts, display, collectPathLikeValues(JSON.parse(rawArgs || "{}")));
+  } catch {}
+  process.stdout.write(`${dim(opts, display).split("\n").map((line) => `    ${line}`).join("\n")}\n`);
 }
 
-function writeToolResult(opts, result) {
+function writeToolResult(opts, result, knownPaths = []) {
   if (opts.noOutput) return;
   const text = String(result);
   const display = text.length > 4000 ? `${text.slice(0, 4000)}\n  …` : text;
   const isError = text === "blocked by user" || text.startsWith("Tool error:") || text.startsWith("command error:");
   const code = isError ? "31" : "2";
-  process.stdout.write(`${color(opts, code, display.split("\n").map((line) => `    ${line}`).join("\n"))}\n`);
+  const paths = new Set([...(knownPaths || []), ...(opts.touchedFiles || [])]);
+  const linked = applyKnownFileLinks(opts, display, paths);
+  process.stdout.write(`${color(opts, code, linked.split("\n").map((line) => `    ${line}`).join("\n"))}\n`);
 }
 
 function readTextFileDisplay(args, result) {
@@ -3059,7 +3116,7 @@ async function streamChat(opts, messages) {
             phase = "final";
           }
           content += delta.content;
-          if (!opts.noOutput) process.stdout.write(delta.content);
+          if (!opts.noOutput) process.stdout.write(applyKnownFileLinks(opts, delta.content, opts.touchedFiles || []));
         }
 
         if (delta.tool_calls) {
@@ -3128,7 +3185,7 @@ async function processAgentTurns(opts, session) {
         execution = executions.shift();
       }
       writeToolCall(opts, execution.name, execution.rawArgs);
-      writeToolResult(opts, toolDisplayResult(execution.name, execution.args, execution.result));
+      writeToolResult(opts, toolDisplayResult(execution.name, execution.args, execution.result), collectPathLikeValues(execution.args));
       session.messages.push({ role: "tool", tool_call_id: execution.call.id, content: String(execution.result) });
       session.touchedFiles = [...(opts.touchedFiles || [])];
       session.cache = { ...(opts.sessionCache || {}) };
