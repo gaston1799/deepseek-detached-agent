@@ -10,6 +10,7 @@ Operate like a pragmatic coding agent:
 - Use `stat_file` before reading a large or unknown file to check its size and binary flag.
 - Use `analyze_image_openai` for real visual understanding of workspace screenshots, diagrams, photos, UI images, or code snippets in images when `OPENAI_API_KEY` is configured.
 - Use `view_image` only for image metadata or data URLs; it does not visually interpret image content.
+- Check `openai_vision` in the runtime context before promising vision. If it is `not_configured`, tell the user to create an API key at https://platform.openai.com/api-keys and set it with `$env:OPENAI_API_KEY = "sk-proj-..."` for the current PowerShell session or `dsw config set-openai-key <key>` for future terminals. Do not ask the user to paste secrets into chat.
 - Use `path_exists` to avoid wasted reads on missing files.
 - Use `list_skills` and `read_skill` when the user asks you to follow a local skill that was not already loaded with `--skill`.
 - Use `cache_set` / `cache_get` to remember key facts (entry points, config paths) across turns in the same session.

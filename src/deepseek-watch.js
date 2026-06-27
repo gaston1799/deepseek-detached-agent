@@ -22,7 +22,9 @@ function usage() {
 
 Usage:
   dsw
+  dsw doctor
   dsw config set-key <key>
+  dsw config set-openai-key <key>
   dsw config path
   dsw -p <prompt> [options]
   dsw --prompt-file <file> [options]
@@ -328,6 +330,8 @@ function gitBranch() {
 
 function runtimeContext() {
   const branch = gitBranch();
+  const openAiConfigured = Boolean(process.env.OPENAI_API_KEY);
+  const openAiModel = process.env.OPENAI_VISION_MODEL || "gpt-4.1-mini";
   return [
     `date: ${new Date().toISOString()}`,
     `device_os: ${platform()} ${release()} ${arch()}`,
@@ -335,6 +339,9 @@ function runtimeContext() {
     `workspace: ${process.cwd()}`,
     `shell: ${process.env.ComSpec || process.env.SHELL || "unknown"}`,
     `node: ${process.version}`,
+    `openai_vision: ${openAiConfigured ? "configured" : "not_configured"}`,
+    `openai_vision_model: ${openAiModel}`,
+    "openai_api_key_setup: https://platform.openai.com/api-keys",
     branch ? `git_branch: ${branch}` : "git_branch: none"
   ].join("\n");
 }
@@ -2000,6 +2007,93 @@ function runLocalCommand(exe, args, timeoutMs, cwd = process.cwd()) {
   });
 }
 
+function commandStatus(command, args = ["--version"]) {
+  const result = spawnSync(command, args, {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    windowsHide: true
+  });
+  return {
+    ok: result.status === 0,
+    status: result.status,
+    stdout: (result.stdout || "").trim(),
+    stderr: (result.stderr || "").trim(),
+    error: result.error?.message || ""
+  };
+}
+
+function maskedSecretStatus(value) {
+  if (!value) return "not set";
+  const text = String(value);
+  if (text.length <= 10) return "set";
+  return `set (${text.slice(0, 7)}...${text.slice(-4)})`;
+}
+
+function setUserEnvironmentVariable(name, value) {
+  const key = String(value || "").trim();
+  if (!key) throw new Error(`${name} cannot be empty.`);
+  if (process.platform === "win32") {
+    const result = spawnSync(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        `[Environment]::SetEnvironmentVariable('${name}', $env:DSW_SECRET_VALUE, 'User')`
+      ],
+      {
+        encoding: "utf8",
+        windowsHide: true,
+        env: { ...process.env, DSW_SECRET_VALUE: key }
+      }
+    );
+    if (result.status !== 0) {
+      throw new Error((result.stderr || result.stdout || `Failed to set ${name}`).trim());
+    }
+    return `${name} saved to the Windows user environment. Open a new terminal for it to appear automatically.`;
+  }
+  throw new Error(`Automatic persistent ${name} setup is only implemented on Windows. Add export ${name}="..." to your shell profile.`);
+}
+
+async function doctor() {
+  const deepSeekKey = await getDeepSeekApiKey();
+  const openAiKey = process.env.OPENAI_API_KEY || "";
+  const skills = await discoverSkills({});
+  const dswStatus = commandStatus("dsw", ["--help"]);
+  const pbcStatus = commandStatus("pbc", ["--help"]);
+  const lines = [
+    "DeepSeek Watch Doctor",
+    "",
+    `Workspace: ${process.cwd()}`,
+    `Node: ${process.version}`,
+    `Config path: ${configPath()}`,
+    "",
+    "DeepSeek",
+    `  API key: ${deepSeekKey ? maskedSecretStatus(deepSeekKey) : "not set"}`,
+    `  Setup: dsw config set-key <deepseek-key>`,
+    "",
+    "OpenAI vision",
+    `  OPENAI_API_KEY: ${maskedSecretStatus(openAiKey)}`,
+    `  OPENAI_VISION_MODEL: ${process.env.OPENAI_VISION_MODEL || "gpt-4.1-mini (default)"}`,
+    `  Tool: analyze_image_openai ${openAiKey ? "available" : "blocked until OPENAI_API_KEY is set"}`,
+    "  Create key: https://platform.openai.com/api-keys",
+    "  Billing/limits: https://platform.openai.com/settings/organization/billing/overview",
+    "  Current terminal: $env:OPENAI_API_KEY = \"sk-proj-...\"",
+    "  Persist for new terminals: dsw config set-openai-key <openai-key>",
+    "",
+    "CLI",
+    `  dsw on PATH: ${dswStatus.ok ? "yes" : "no"}`,
+    `  pbc on PATH: ${pbcStatus.ok ? "yes" : "no"}`,
+    "",
+    "Skills",
+    `  discovered: ${skills.length}`,
+    ...skills.slice(0, 8).map((skill) => `  - ${skill.name}: ${skill.path}`),
+    skills.length > 8 ? `  ... ${skills.length - 8} more` : ""
+  ].filter((line) => line !== "");
+  return lines.join("\n");
+}
+
 async function maybeRunShellTool(opts, shellName, command, timeoutMs, cwd = process.cwd()) {
   const timeout = Math.min(Number(timeoutMs) || 60000, 600000);
   if (!command || typeof command !== "string") return "command error: command must be a non-empty string";
@@ -2900,6 +2994,11 @@ function isExitCommand(text) {
 
 async function run() {
   const argv = process.argv.slice(2);
+  if (argv[0] === "doctor") {
+    process.stdout.write(`${await doctor()}\n`);
+    return;
+  }
+
   if (argv[0] === "config") {
     const command = argv[1];
     if (command === "set-key") {
@@ -2907,11 +3006,15 @@ async function run() {
       process.stdout.write(`Saved DeepSeek API key to ${configPath()}\n`);
       return;
     }
+    if (command === "set-openai-key") {
+      process.stdout.write(`${setUserEnvironmentVariable("OPENAI_API_KEY", argv[2] || "")}\n`);
+      return;
+    }
     if (command === "path") {
       process.stdout.write(`${configPath()}\n`);
       return;
     }
-    throw new Error("Unknown config command. Use: dsw config set-key <key>");
+    throw new Error("Unknown config command. Use: dsw config set-key <key> or dsw config set-openai-key <key>");
   }
 
   const opts = argv.length === 0 ? await dashboardOpts() : parseArgs(argv);

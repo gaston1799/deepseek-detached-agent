@@ -202,6 +202,16 @@ search_code { "pattern": "TODO", "glob": "**/*.ts", "context_lines": 2 }
   -h, --help                       Show help
 ```
 
+### Doctor
+
+Run a local readiness check:
+
+```powershell
+d doctor
+```
+
+Doctor reports DeepSeek key status, OpenAI vision status, selected vision model, CLI availability, and discovered skills. It does not print full API keys.
+
 ### Local skills
 
 `dsw` can load Codex-style local skills by appending their `SKILL.md` files to the system prompt:
@@ -235,6 +245,14 @@ Future resumes of that session reuse the saved skills automatically unless you p
 $env:OPENAI_API_KEY = "sk-..."
 d -p "read the code in screenshot.png" --permission review
 ```
+
+To persist the OpenAI key for future terminals on Windows:
+
+```powershell
+d config set-openai-key sk-proj-your-full-key
+```
+
+This writes `OPENAI_API_KEY` to your Windows user environment. Open a new terminal after running it.
 
 Use `OPENAI_VISION_MODEL` to override the default OpenAI vision model:
 
