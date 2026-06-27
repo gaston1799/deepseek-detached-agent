@@ -10,11 +10,13 @@
     "dswait": "./src/wait-for-file.js"
   },
   "scripts": {
-    "check": "node --check src/api-error.js && node --check src/config.js && node --check src/deepseek-request.js && node --check src/session-memory.js && node --check src/deepseek-watch.js && node --check src/deepseek-detached.js && node --check src/wait-for-file.js",
+    "check": "node --check src/api-error.js && node --check src/config.js && node --check src/deepseek-request.js && node --check src/session-memory.js && node --check src/deepseek-watch.js && node --check src/deepseek-detached.js && node --check src/wait-for-file.js && node --check src/ui/main.cjs && node --check src/ui/preload.cjs",
+    "ui": "node src/deepseek-watch.js -ui",
     "smoke": "node src/deepseek-watch.js --help && node src/deepseek-detached.js --help && node src/wait-for-file.js --help",
     "build:exe": "node build-exe.js"
   },
   "devDependencies": {
+    "electron": "^42.5.0",
     "esbuild": "^0.25.0",
     "postject": "^1.0.0-alpha.6"
   },

@@ -15,10 +15,11 @@
 - **Web search** — search current external information from the agent loop
 - **Shell tools** — run `cmd.exe` and PowerShell with per-session permission controls
 - **Session memory** — every conversation is saved; resume any previous session
+- **Electron UI** — launch `d -ui` for a desktop chat surface with a local control API and CDP port
 - **Unlimited tool turns** — no cap on how many tool-call loops it can make
 - **Detached mode** — fire a prompt in the background and poll for the output file
 - **Claude fallback** — `dsd` falls back to `claude -p` if DeepSeek is unavailable
-- **Zero npm dependencies** — pure Node.js (`fetch`, `fs/promises`, `child_process`)
+- **Dependency-light CLI** — core agent tools use built-in Node APIs; Electron is used only for `d -ui`
 - **OpenAI-compatible** — point at any compatible endpoint via `--base-url`
 
 ---
@@ -57,6 +58,9 @@ dsw -p "explain this codebase"
 # Open the TUI dashboard (no args)
 dsw
 
+# Open the Electron desktop UI
+d -ui
+
 # Resume a previous session
 dsw --resume
 ```
@@ -68,6 +72,7 @@ dsw --resume
 | Command | Alias | Description |
 |---------|-------|-------------|
 | `dsw` | `d` | Interactive agent — streams thinking, calls tools, saves sessions |
+| `dsw -ui` | `d -ui` | Electron desktop UI with HTTP control API and CDP debugging port |
 | `dsd` | — | Fire-and-forget: prompt → Markdown file, optional Claude fallback |
 | `dswait` | — | Poll until a detached output file appears |
 
@@ -85,6 +90,30 @@ dsw --resume
 dsw --permission review -p "audit the auth module"
 dsw --permission full   -p "refactor utils.js to use ES modules"
 ```
+
+---
+
+## Desktop UI
+
+Launch the Electron UI instead of the terminal dashboard:
+
+```bash
+d -ui
+```
+
+Useful options:
+
+```bash
+d -ui --ui-port 17891 --ui-cdp-port 9223
+```
+
+- UI control API: `http://127.0.0.1:17891`
+- CDP / remote debugging: `http://127.0.0.1:9223`
+- Health check: `GET /health`
+- Start a run: `POST /chat` with `{"prompt":"...","permission":"review"}` or `{"permission":"full"}`
+- Inspect runs: `GET /runs` and `GET /runs/<id>`
+
+The UI delegates chat execution back to the existing `d` CLI and writes run output under `.deepseek-watch/ui/<run-id>/`.
 
 ---
 

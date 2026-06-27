@@ -5,6 +5,7 @@ import { platform, release, arch, userInfo, homedir } from "node:os";
 import { dirname, extname, isAbsolute, join, resolve, relative, delimiter } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { clearLine, createInterface, cursorTo } from "node:readline";
+import { fileURLToPath } from "node:url";
 import { deepSeekHttpError } from "./api-error.js";
 import { configPath, getDeepSeekApiKey, setDeepSeekApiKey } from "./config.js";
 import { applyThinkingOptions } from "./deepseek-request.js";
@@ -16,12 +17,15 @@ const DEFAULT_MODEL = "deepseek-v4-flash";
 // In normal dev/npm installs it is undefined and the file is read at runtime instead.
 const EMBEDDED_SYSTEM_PROMPT = typeof __SYSTEM_PROMPT__ !== "undefined" ? __SYSTEM_PROMPT__ : null;
 const DEFAULT_SYSTEM_PROMPT_FILE = EMBEDDED_SYSTEM_PROMPT ? null : new URL("../prompts/default-system.md", import.meta.url);
+const EMBEDDED_UI_APP_DIR = typeof __UI_APP_DIR__ !== "undefined" ? __UI_APP_DIR__ : null;
+const UI_APP_DIR = EMBEDDED_UI_APP_DIR || dirname(fileURLToPath(new URL("./ui/main.cjs", import.meta.url)));
 
 function usage() {
   return `dsw  (alias: d)
 
 Usage:
   dsw
+  dsw -ui [options]
   dsw doctor
   dsw config set-key <key>
   dsw config set-openai-key <key>
@@ -31,6 +35,9 @@ Usage:
   dsw --stdin [options]
 
 Options:
+  -ui, --ui                   Launch the Electron desktop UI instead of the CLI/TUI.
+  --ui-port <number>          UI control HTTP port. Default: 17891
+  --ui-cdp-port <number>      Electron remote debugging/CDP port. Default: 9223
   -p, --prompt <text>          Prompt content.
   --prompt-file <file>         Read prompt content from a file.
   --stdin                      Read prompt content from stdin.
@@ -3101,8 +3108,87 @@ function isExitCommand(text) {
   return ["/exit", "/quit", "/end", "exit", "quit"].includes(text.trim().toLowerCase());
 }
 
+function parseUiArgs(argv) {
+  const opts = {
+    port: Number.parseInt(process.env.DEEPSEEK_UI_PORT || "17891", 10),
+    cdpPort: Number.parseInt(process.env.DEEPSEEK_UI_CDP_PORT || "9223", 10)
+  };
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    const next = () => {
+      i += 1;
+      if (i >= argv.length) throw new Error(`Missing value for ${arg}`);
+      return argv[i];
+    };
+    if (arg === "--ui-port") opts.port = Number.parseInt(next(), 10);
+    else if (arg === "--ui-cdp-port" || arg === "--cdp-port") opts.cdpPort = Number.parseInt(next(), 10);
+    else if (arg === "-h" || arg === "--help") opts.help = true;
+    else throw new Error(`Unknown UI argument: ${arg}`);
+  }
+  if (!Number.isFinite(opts.port) || opts.port <= 0) throw new Error("--ui-port must be a positive number.");
+  if (!Number.isFinite(opts.cdpPort) || opts.cdpPort <= 0) throw new Error("--ui-cdp-port must be a positive number.");
+  return opts;
+}
+
+function electronCommand() {
+  const cmd = process.platform === "win32" ? "electron.cmd" : "electron";
+  const exe = process.platform === "win32" ? "electron.exe" : "electron";
+  const local = resolve(process.cwd(), "node_modules", ".bin", cmd);
+  const repoLocal = resolve(UI_APP_DIR, "..", "..", "node_modules", ".bin", cmd);
+  const localExe = resolve(process.cwd(), "node_modules", "electron", "dist", exe);
+  const repoLocalExe = resolve(UI_APP_DIR, "..", "..", "node_modules", "electron", "dist", exe);
+  for (const candidate of [repoLocalExe, localExe, repoLocal, local]) {
+    const result = spawnSync(candidate, ["--version"], { encoding: "utf8", windowsHide: true });
+    if (result.status === 0) return candidate;
+  }
+  const pathResult = spawnSync(cmd, ["--version"], { encoding: "utf8", windowsHide: true });
+  if (pathResult.status === 0) return cmd;
+  throw new Error("Electron was not found. Run `npm install` in the deepseek-detached-agent repo, then retry `d -ui`.");
+}
+
+function cliLaunchEnv() {
+  const script = process.argv[1] && process.argv[1].endsWith("deepseek-watch.js") ? resolve(process.argv[1]) : "";
+  return {
+    DEEPSEEK_UI_CLI_EXE: process.execPath,
+    DEEPSEEK_UI_CLI_SCRIPT: script,
+    DEEPSEEK_UI_WORKSPACE: process.cwd()
+  };
+}
+
+function launchElectronUi(argv) {
+  const opts = parseUiArgs(argv);
+  if (opts.help) {
+    process.stdout.write("Usage: d -ui [--ui-port 17891] [--ui-cdp-port 9223]\n");
+    return;
+  }
+  const electron = electronCommand();
+  const args = [
+    `--remote-debugging-port=${opts.cdpPort}`,
+    UI_APP_DIR
+  ];
+  const env = {
+    ...process.env,
+    ...cliLaunchEnv(),
+    DEEPSEEK_UI_PORT: String(opts.port),
+    DEEPSEEK_UI_CDP_PORT: String(opts.cdpPort)
+  };
+  const child = spawn(electron, args, {
+    cwd: process.cwd(),
+    env,
+    stdio: "inherit",
+    windowsHide: false
+  });
+  child.on("exit", (code) => {
+    process.exitCode = code ?? 0;
+  });
+}
+
 async function run() {
   const argv = process.argv.slice(2);
+  if (argv[0] === "-ui" || argv[0] === "--ui" || argv[0] === "ui") {
+    launchElectronUi(argv.slice(1));
+    return;
+  }
   if (argv[0] === "doctor") {
     process.stdout.write(`${await doctor()}\n`);
     return;

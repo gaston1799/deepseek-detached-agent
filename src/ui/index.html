@@ -1,0 +1,411 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DeepSeek Watch</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f1115;
+      --panel: #171a21;
+      --panel-2: #1f2430;
+      --line: #303746;
+      --text: #eceff4;
+      --muted: #9aa4b2;
+      --accent: #47c2ff;
+      --ok: #6ee7a8;
+      --bad: #ff7b7b;
+      --warn: #ffd36a;
+      font-family: "Segoe UI", system-ui, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    .app {
+      display: grid;
+      grid-template-columns: minmax(320px, 390px) minmax(0, 1fr);
+      min-height: 100vh;
+    }
+
+    aside {
+      border-right: 1px solid var(--line);
+      background: #12151b;
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    main {
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      min-width: 0;
+    }
+
+    h1, h2 {
+      margin: 0;
+      font-weight: 650;
+      letter-spacing: 0;
+    }
+
+    h1 { font-size: 22px; }
+    h2 { font-size: 15px; color: var(--muted); }
+
+    .meta, .run-meta {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+      word-break: break-word;
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 220px;
+      resize: vertical;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--text);
+      padding: 12px;
+      font: 14px/1.45 ui-monospace, "Cascadia Mono", Consolas, monospace;
+      outline: none;
+    }
+
+    textarea:focus, select:focus, button:focus-visible {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(71, 194, 255, 0.18);
+    }
+
+    label {
+      display: grid;
+      gap: 7px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+    }
+
+    select, button {
+      height: 38px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 0 11px;
+      font: inherit;
+    }
+
+    button {
+      cursor: pointer;
+      background: #245b78;
+      border-color: #367da1;
+      font-weight: 650;
+    }
+
+    button:disabled {
+      cursor: wait;
+      opacity: 0.62;
+    }
+
+    .toolbar {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      align-items: end;
+    }
+
+    .runs {
+      display: grid;
+      gap: 8px;
+      overflow: auto;
+      padding-right: 2px;
+    }
+
+    .run {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 11px;
+      cursor: pointer;
+    }
+
+    .run.active {
+      border-color: var(--accent);
+      background: #182331;
+    }
+
+    .run-title {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .status {
+      color: var(--warn);
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+
+    .status.complete { color: var(--ok); }
+    .status.error { color: var(--bad); }
+
+    .topbar {
+      border-bottom: 1px solid var(--line);
+      padding: 18px 22px;
+      background: #12151b;
+      display: flex;
+      justify-content: space-between;
+      gap: 18px;
+      align-items: center;
+    }
+
+    .content {
+      min-width: 0;
+      overflow: auto;
+      padding: 22px;
+      display: grid;
+      gap: 18px;
+      align-content: start;
+    }
+
+    .output {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      min-height: 320px;
+      padding: 16px;
+      white-space: pre-wrap;
+      line-height: 1.55;
+      overflow-wrap: anywhere;
+    }
+
+    .files {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .file {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 5px 9px;
+      color: var(--muted);
+      font-size: 12px;
+      background: var(--panel);
+    }
+
+    .logs {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    pre {
+      margin: 0;
+      max-height: 180px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #0b0d11;
+      padding: 12px;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: pre-wrap;
+    }
+
+    @media (max-width: 880px) {
+      .app { grid-template-columns: 1fr; }
+      aside { border-right: 0; border-bottom: 1px solid var(--line); }
+      .logs { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside>
+      <header>
+        <h1>DeepSeek Watch</h1>
+        <div class="meta" id="meta">Starting...</div>
+      </header>
+
+      <label>
+        Prompt
+        <textarea id="prompt" spellcheck="false">Read the workspace and summarize what this project does. Do not edit files.</textarea>
+      </label>
+
+      <div class="toolbar">
+        <label>
+          Permission
+          <select id="permission">
+            <option value="review">Review only</option>
+            <option value="full">Full access</option>
+          </select>
+        </label>
+        <button id="send">Run</button>
+      </div>
+
+      <section>
+        <h2>Runs</h2>
+        <div class="runs" id="runs"></div>
+      </section>
+    </aside>
+
+    <main>
+      <div class="topbar">
+        <div>
+          <h1 id="title">No run selected</h1>
+          <div class="run-meta" id="run-meta">Start a run or send one through the control API.</div>
+        </div>
+        <div class="status" id="status">idle</div>
+      </div>
+
+      <div class="content">
+        <section>
+          <h2>Final Response</h2>
+          <div class="output" id="output">Waiting for a run.</div>
+        </section>
+
+        <section>
+          <h2>Files Touched</h2>
+          <div class="files" id="files"></div>
+        </section>
+
+        <section class="logs">
+          <div>
+            <h2>Stdout</h2>
+            <pre id="stdout"></pre>
+          </div>
+          <div>
+            <h2>Stderr</h2>
+            <pre id="stderr"></pre>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    const promptEl = document.querySelector("#prompt");
+    const permissionEl = document.querySelector("#permission");
+    const sendEl = document.querySelector("#send");
+    const runsEl = document.querySelector("#runs");
+    const outputEl = document.querySelector("#output");
+    const filesEl = document.querySelector("#files");
+    const stdoutEl = document.querySelector("#stdout");
+    const stderrEl = document.querySelector("#stderr");
+    const statusEl = document.querySelector("#status");
+    const titleEl = document.querySelector("#title");
+    const runMetaEl = document.querySelector("#run-meta");
+    const metaEl = document.querySelector("#meta");
+
+    let runs = [];
+    let selectedId = null;
+
+    function shortId(id) {
+      return id ? id.slice(0, 8) : "";
+    }
+
+    function renderRuns() {
+      runsEl.innerHTML = "";
+      if (!runs.length) {
+        runsEl.innerHTML = '<div class="meta">No runs yet.</div>';
+        return;
+      }
+      for (const run of runs) {
+        const item = document.createElement("div");
+        item.className = `run ${run.id === selectedId ? "active" : ""}`;
+        item.innerHTML = `
+          <div class="run-title">
+            <span>${shortId(run.id)}</span>
+            <span class="status ${run.status}">${run.status}</span>
+          </div>
+          <div class="run-meta">${run.permission} · ${new Date(run.createdAt).toLocaleTimeString()}</div>
+        `;
+        item.addEventListener("click", () => {
+          selectedId = run.id;
+          render();
+        });
+        runsEl.appendChild(item);
+      }
+    }
+
+    function renderRun(run) {
+      if (!run) {
+        titleEl.textContent = "No run selected";
+        runMetaEl.textContent = "Start a run or send one through the control API.";
+        statusEl.textContent = "idle";
+        statusEl.className = "status";
+        outputEl.textContent = "Waiting for a run.";
+        filesEl.innerHTML = "";
+        stdoutEl.textContent = "";
+        stderrEl.textContent = "";
+        return;
+      }
+      titleEl.textContent = `Run ${shortId(run.id)}`;
+      runMetaEl.textContent = `${run.outputFile} · exit ${run.exitCode ?? "pending"}`;
+      statusEl.textContent = run.status;
+      statusEl.className = `status ${run.status}`;
+      outputEl.textContent = run.finalResponse || (run.status === "running" ? "Running..." : "No final response.");
+      filesEl.innerHTML = "";
+      for (const file of run.touchedFiles || []) {
+        const chip = document.createElement("span");
+        chip.className = "file";
+        chip.textContent = file;
+        filesEl.appendChild(chip);
+      }
+      if (!filesEl.children.length) filesEl.innerHTML = '<span class="meta">None</span>';
+      stdoutEl.textContent = run.stdoutTail || "";
+      stderrEl.textContent = run.stderrTail || "";
+    }
+
+    function render() {
+      renderRuns();
+      renderRun(runs.find((run) => run.id === selectedId) || runs[0]);
+    }
+
+    async function startRun() {
+      sendEl.disabled = true;
+      try {
+        const run = await window.deepseekUi.startChat({
+          prompt: promptEl.value,
+          permission: permissionEl.value
+        });
+        selectedId = run.id;
+      } finally {
+        sendEl.disabled = false;
+      }
+    }
+
+    sendEl.addEventListener("click", startRun);
+
+    window.deepseekUi.info().then((info) => {
+      metaEl.textContent = `${info.workspace}\nAPI http://127.0.0.1:${info.controlPort} · CDP ${info.cdpPort}`;
+    });
+    window.deepseekUi.listRuns().then((initial) => {
+      runs = initial;
+      render();
+    });
+    window.deepseekUi.onRuns((next) => {
+      runs = next;
+      if (!selectedId && runs[0]) selectedId = runs[0].id;
+      render();
+    });
+    window.deepseekUi.onRun((run) => {
+      runs = runs.map((item) => item.id === run.id ? run : item);
+      if (!runs.some((item) => item.id === run.id)) runs.unshift(run);
+      selectedId = selectedId || run.id;
+      render();
+    });
+  </script>
+</body>
+</html>

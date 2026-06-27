@@ -57,7 +57,10 @@ for (const { name, src } of ENTRIES) {
     platform: "node",
     format: "cjs",
     external: ["node:*"],
-    define: { __SYSTEM_PROMPT__: JSON.stringify(systemPrompt) },
+    define: {
+      __SYSTEM_PROMPT__: JSON.stringify(systemPrompt),
+      __UI_APP_DIR__: JSON.stringify(resolve(ROOT, "src", "ui"))
+    },
     outfile: cjs
   });
 
