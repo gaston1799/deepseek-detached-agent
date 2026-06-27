@@ -4,7 +4,7 @@ import { closeSync, openSync } from "node:fs";
 import { platform, release, arch, userInfo, homedir } from "node:os";
 import { dirname, extname, isAbsolute, join, resolve, relative, delimiter } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import { createInterface } from "node:readline";
+import { clearLine, createInterface, cursorTo } from "node:readline";
 import { deepSeekHttpError } from "./api-error.js";
 import { configPath, getDeepSeekApiKey, setDeepSeekApiKey } from "./config.js";
 import { applyThinkingOptions } from "./deepseek-request.js";
@@ -394,6 +394,87 @@ function red(opts, text) {
 
 function bold(opts, text) {
   return color(opts, "1", text);
+}
+
+function estimateTokens(text) {
+  return Math.max(0, Math.ceil(String(text || "").length / 4));
+}
+
+const STREAM_STATUS_PHRASES = [
+  "Generating",
+  "Thinking",
+  "Working",
+  "Preparing",
+  "Drafting"
+];
+
+function randomStatusPhrase(phrases = STREAM_STATUS_PHRASES) {
+  return phrases[Math.floor(Math.random() * phrases.length)] || "Working";
+}
+
+function createStatusLine(opts, phrase = "Working", initialTokens = 0) {
+  if (opts.noOutput || !process.stdout.isTTY) {
+    return {
+      addTokens() {},
+      setTokens() {},
+      setPhrase() {},
+      clear() {},
+      stop() {}
+    };
+  }
+
+  let tokens = initialTokens;
+  let currentPhrase = phrase;
+  let active = true;
+  let visible = false;
+  const started = Date.now();
+
+  const render = () => {
+    if (!active) return;
+    const dots = ".".repeat((Math.floor((Date.now() - started) / 750) % 3) + 1);
+    clearLine(process.stdout, 0);
+    cursorTo(process.stdout, 0);
+    process.stdout.write(dim(opts, `  ${currentPhrase}${dots} (${tokens} tokens)`));
+    visible = true;
+  };
+
+  const timer = setInterval(render, 750);
+  render();
+
+  return {
+    addTokens(value) {
+      tokens += estimateTokens(value);
+      render();
+    },
+    setTokens(value) {
+      tokens = Math.max(0, Math.ceil(Number(value) || 0));
+      render();
+    },
+    setPhrase(value) {
+      currentPhrase = value || currentPhrase;
+      render();
+    },
+    clear() {
+      if (!visible) return;
+      clearLine(process.stdout, 0);
+      cursorTo(process.stdout, 0);
+      visible = false;
+    },
+    stop() {
+      active = false;
+      clearInterval(timer);
+      this.clear();
+    }
+  };
+}
+
+function toolStatusPhrase(name) {
+  if (name === "write_text_file") return "Writing file";
+  if (name === "patch_text_file" || name === "patch_files") return "Patching files";
+  if (name === "run_cmd" || name === "run_powershell" || name === "functions_shell_command" || name === "functions.shell_command") return "Running command";
+  if (name === "web_search" || name === "web_fetch") return "Reading web";
+  if (name === "analyze_image_openai" || name === "view_image") return "Reading image";
+  return randomStatusPhrase(["Running tool", "Working", "Processing"]);
 }
 
 // ── Workspace traversal helpers ────────────────────────────────────────────
@@ -2881,6 +2962,7 @@ async function streamChat(opts, messages) {
   let content = "";
   let reasoningContent = "";
   let phase = "";
+  const status = createStatusLine(opts, randomStatusPhrase());
   try {
     const body = {
       model: opts.model,
@@ -2918,6 +3000,8 @@ async function streamChat(opts, messages) {
         const delta = data.choices?.[0]?.delta || {};
 
         if (delta.reasoning_content) {
+          status.addTokens(delta.reasoning_content);
+          status.stop();
           if (phase !== "thinking") {
             heading(opts, "thinking", "thinking");
             phase = "thinking";
@@ -2927,6 +3011,8 @@ async function streamChat(opts, messages) {
         }
 
         if (delta.content) {
+          status.addTokens(delta.content);
+          status.stop();
           if (phase !== "final") {
             heading(opts, "final", "final");
             phase = "final";
@@ -2935,13 +3021,19 @@ async function streamChat(opts, messages) {
           if (!opts.noOutput) process.stdout.write(delta.content);
         }
 
-        if (delta.tool_calls) mergeToolDelta(toolCalls, delta.tool_calls);
+        if (delta.tool_calls) {
+          status.setPhrase("Preparing tools");
+          status.addTokens(JSON.stringify(delta.tool_calls));
+          mergeToolDelta(toolCalls, delta.tool_calls);
+        }
       }
     }
 
+    status.stop();
     if (!opts.noOutput) process.stdout.write("\n");
     return { role: "assistant", content, reasoning_content: reasoningContent, tool_calls: toolCalls.length ? toolCalls : undefined };
   } catch (error) {
+    status.stop();
     if (opts.interrupted || error?.name === "AbortError") {
       if (!opts.noOutput) process.stdout.write("\n");
       return {
@@ -2953,6 +3045,7 @@ async function streamChat(opts, messages) {
     }
     throw error;
   } finally {
+    status.stop();
     cleanupInterrupt();
     opts.interrupted = false;
     clearTimeout(timer);
@@ -2970,12 +3063,28 @@ async function processAgentTurns(opts, session) {
     heading(opts, "tool calls", "tools");
 
     const sequential = shouldRunToolsSequentially(opts, assistant.tool_calls);
-    const executions = sequential
-      ? []
-      : await Promise.all(assistant.tool_calls.map((call) => executeToolCall(opts, call)));
+    let executions = [];
+    if (!sequential) {
+      const status = createStatusLine(opts, "Running tools", assistant.tool_calls.reduce((sum, call) => sum + estimateTokens(call.function?.arguments || ""), 0));
+      try {
+        executions = await Promise.all(assistant.tool_calls.map((call) => executeToolCall(opts, call)));
+      } finally {
+        status.stop();
+      }
+    }
 
     for (const call of assistant.tool_calls) {
-      const execution = sequential ? await executeToolCall(opts, call) : executions.shift();
+      let execution;
+      if (sequential) {
+        const status = createStatusLine(opts, toolStatusPhrase(call.function?.name || "tool"), estimateTokens(call.function?.arguments || ""));
+        try {
+          execution = await executeToolCall(opts, call);
+        } finally {
+          status.stop();
+        }
+      } else {
+        execution = executions.shift();
+      }
       writeToolCall(opts, execution.name, execution.rawArgs);
       writeToolResult(opts, toolDisplayResult(execution.name, execution.args, execution.result));
       session.messages.push({ role: "tool", tool_call_id: execution.call.id, content: String(execution.result) });
