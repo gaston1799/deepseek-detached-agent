@@ -458,6 +458,42 @@ function estimateTokens(text) {
   return Math.max(0, Math.ceil(String(text || "").length / 4));
 }
 
+function formatCompactCount(value) {
+  const count = Math.max(0, Math.round(Number(value) || 0));
+  if (count < 1000) return String(count);
+  const units = [
+    [1_000_000_000, "b"],
+    [1_000_000, "m"],
+    [1_000, "k"]
+  ];
+  for (const [size, suffix] of units) {
+    if (count >= size) return `${(count / size).toFixed(2)}${suffix}`;
+  }
+  return String(count);
+}
+
+function estimateMessageTokens(message) {
+  if (!message || typeof message !== "object") return 0;
+  let total = estimateTokens(message.role || "") + 4;
+  total += estimateTokens(message.content || "");
+  total += estimateTokens(message.reasoning_content || "");
+  if (message.name) total += estimateTokens(message.name);
+  if (message.tool_call_id) total += estimateTokens(message.tool_call_id);
+  if (Array.isArray(message.tool_calls)) {
+    for (const call of message.tool_calls) {
+      total += estimateTokens(call.id || "");
+      total += estimateTokens(call.type || "");
+      total += estimateTokens(call.function?.name || "");
+      total += estimateTokens(call.function?.arguments || "");
+    }
+  }
+  return total;
+}
+
+function estimateContextTokens(messages) {
+  return (messages || []).reduce((sum, message) => sum + estimateMessageTokens(message), 0);
+}
+
 const STREAM_STATUS_PHRASES = [
   "Generating",
   "Thinking",
@@ -3404,7 +3440,8 @@ async function run() {
   await maybeWriteOutput(opts, session);
 
   while (opts.interactiveChat) {
-    process.stdout.write(`\n  ${dim(opts, "Enter to send, /exit to quit, Ctrl+C to exit")}\n`);
+    const contextTokens = formatCompactCount(estimateContextTokens(session.messages));
+    process.stdout.write(`\n  ${dim(opts, `Enter to send, /exit to quit, Ctrl+C to exit · context ${contextTokens} tokens`)}\n`);
     const nextPrompt = await promptLine("  > ");
     if (!nextPrompt.trim()) continue;
     if (isExitCommand(nextPrompt)) return;
