@@ -2746,12 +2746,42 @@ function repairToolCallHistory(messages) {
   return { messages: repaired, repairs };
 }
 
+function installStreamInterruptHandler(opts, controller) {
+  if (!opts.interactiveChat || !process.stdin.isTTY || typeof process.stdin.setRawMode !== "function") {
+    return () => {};
+  }
+
+  const stdin = process.stdin;
+  const wasRaw = Boolean(stdin.isRaw);
+  const wasPaused = stdin.isPaused();
+  const onData = (chunk) => {
+    const text = chunk.toString("utf8");
+    if (text === "\u001b" || text === "\u0003") {
+      opts.interrupted = true;
+      if (!opts.noOutput) process.stderr.write("\n[interrupted]\n");
+      controller.abort();
+    }
+  };
+
+  stdin.resume();
+  stdin.setRawMode(true);
+  stdin.on("data", onData);
+
+  return () => {
+    stdin.off("data", onData);
+    try { stdin.setRawMode(wasRaw); } catch {}
+    if (wasPaused) stdin.pause();
+    try { while (stdin.read() !== null) {} } catch {}
+  };
+}
+
 async function streamChat(opts, messages) {
   const apiKey = await getDeepSeekApiKey();
   if (!apiKey) throw new Error("No DeepSeek API key found. Run: dsw config set-key <key>");
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), opts.timeout);
+  const cleanupInterrupt = installStreamInterruptHandler(opts, controller);
   const toolCalls = [];
   let content = "";
   let reasoningContent = "";
@@ -2816,7 +2846,20 @@ async function streamChat(opts, messages) {
 
     if (!opts.noOutput) process.stdout.write("\n");
     return { role: "assistant", content, reasoning_content: reasoningContent, tool_calls: toolCalls.length ? toolCalls : undefined };
+  } catch (error) {
+    if (opts.interrupted || error?.name === "AbortError") {
+      if (!opts.noOutput) process.stdout.write("\n");
+      return {
+        role: "assistant",
+        content: content.trim() ? `${content.trim()}\n\n[interrupted by user]` : "[interrupted by user]",
+        reasoning_content: reasoningContent,
+        interrupted: true
+      };
+    }
+    throw error;
   } finally {
+    cleanupInterrupt();
+    opts.interrupted = false;
     clearTimeout(timer);
   }
 }
@@ -2827,6 +2870,7 @@ async function processAgentTurns(opts, session) {
     session.messages.push(assistant);
     if (opts.saveSession) await writeSession(opts.session, touchSession(session));
 
+    if (assistant.interrupted) return;
     if (!assistant.tool_calls?.length) return;
     heading(opts, "tool calls", "tools");
 
