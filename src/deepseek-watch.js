@@ -422,6 +422,7 @@ function randomStatusPhrase(phrases = STREAM_STATUS_PHRASES) {
 function createStatusLine(opts, phrase = "Working", initialTokens = 0) {
   if (opts.noOutput || !process.stdout.isTTY) {
     return {
+      isActive() { return false; },
       addTokens() {},
       setTokens() {},
       setPhrase() {},
@@ -449,6 +450,9 @@ function createStatusLine(opts, phrase = "Working", initialTokens = 0) {
   render();
 
   return {
+    isActive() {
+      return active;
+    },
     addTokens(value) {
       tokens += estimateTokens(value);
       render();
@@ -634,18 +638,43 @@ function writeSessionNotice(opts, path) {
   process.stderr.write(`  ${color(opts, "2;35", `${ICONS.session} session`)}  ${dim(opts, path)}\n`);
 }
 
-function formatJsonish(raw) {
+function compactDisplayString(value, max = 700) {
+  const text = String(value || "");
+  if (text.length <= max) return text;
+  const head = Math.floor(max * 0.65);
+  const tail = Math.max(80, max - head - 80);
+  return `${text.slice(0, head)}\n... [truncated ${text.length - max} chars] ...\n${text.slice(-tail)}`;
+}
+
+function compactToolArgsForDisplay(value) {
+  if (Array.isArray(value)) return value.map(compactToolArgsForDisplay);
+  if (!value || typeof value !== "object") return value;
+  const out = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item === "string" && ["content", "old_string", "new_string"].includes(key)) {
+      out[key] = compactDisplayString(item);
+      out[`${key}_display_note`] = `truncated for terminal display; original length ${item.length} chars`;
+    } else {
+      out[key] = compactToolArgsForDisplay(item);
+    }
+  }
+  return out;
+}
+
+function formatJsonish(raw, name = "") {
   try {
-    return JSON.stringify(JSON.parse(raw || "{}"), null, 2);
+    const parsed = JSON.parse(raw || "{}");
+    const shouldCompact = ["write_text_file", "patch_text_file", "patch_files"].includes(name);
+    return JSON.stringify(shouldCompact ? compactToolArgsForDisplay(parsed) : parsed, null, 2);
   } catch {
-    return raw;
+    return compactDisplayString(raw, 1600);
   }
 }
 
 function writeToolCall(opts, name, rawArgs) {
   if (opts.noOutput) return;
   process.stdout.write(`  ${yellow(opts, "▹")} ${bold(opts, name)}\n`);
-  process.stdout.write(`${dim(opts, formatJsonish(rawArgs)).split("\n").map((line) => `    ${line}`).join("\n")}\n`);
+  process.stdout.write(`${dim(opts, formatJsonish(rawArgs, name)).split("\n").map((line) => `    ${line}`).join("\n")}\n`);
 }
 
 function writeToolResult(opts, result) {
@@ -2969,7 +2998,12 @@ async function streamChat(opts, messages) {
   let content = "";
   let reasoningContent = "";
   let phase = "";
-  const status = createStatusLine(opts, randomStatusPhrase());
+  let status = createStatusLine(opts, randomStatusPhrase());
+  const ensureToolStatus = () => {
+    if (status.isActive()) return status;
+    status = createStatusLine(opts, "Preparing tools");
+    return status;
+  };
   try {
     const body = {
       model: opts.model,
@@ -3029,8 +3063,9 @@ async function streamChat(opts, messages) {
         }
 
         if (delta.tool_calls) {
-          status.setPhrase("Preparing tools");
-          status.addTokens(JSON.stringify(delta.tool_calls));
+          const toolStatus = ensureToolStatus();
+          toolStatus.setPhrase("Preparing tools");
+          toolStatus.addTokens(JSON.stringify(delta.tool_calls));
           mergeToolDelta(toolCalls, delta.tool_calls);
         }
       }
