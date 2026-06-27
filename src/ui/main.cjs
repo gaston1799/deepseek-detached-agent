@@ -1,8 +1,7 @@
 const { app, BrowserWindow, ipcMain } = require("electron");
 const { createServer } = require("node:http");
-const { mkdir, readFile, writeFile } = require("node:fs/promises");
-const { createReadStream } = require("node:fs");
-const { dirname, join, resolve } = require("node:path");
+const { mkdir, readdir, readFile, writeFile } = require("node:fs/promises");
+const { join, resolve } = require("node:path");
 const { spawn } = require("node:child_process");
 const { randomUUID } = require("node:crypto");
 
@@ -12,6 +11,7 @@ const cliScript = process.env.DEEPSEEK_UI_CLI_SCRIPT || "";
 const controlPort = Number.parseInt(process.env.DEEPSEEK_UI_PORT || "17891", 10);
 const cdpPort = Number.parseInt(process.env.DEEPSEEK_UI_CDP_PORT || "9223", 10);
 const runs = new Map();
+const sessionDir = resolve(workspace, ".deepseek-watch", "sessions");
 
 let mainWindow = null;
 let server = null;
@@ -39,9 +39,99 @@ function readRequestJson(req) {
   });
 }
 
-function cliCommandArgs(promptFile, outputFile, permission) {
+function compactText(value, max = 1200) {
+  const text = String(value || "").replace(/\r\n/g, "\n").trim();
+  if (text.length <= max) return text;
+  return `${text.slice(0, max).trimEnd()}\n...`;
+}
+
+function firstUserPrompt(session) {
+  return session.messages?.find((message) => message.role === "user")?.content || "";
+}
+
+function sessionTitle(session, file) {
+  const prompt = firstUserPrompt(session).replace(/\s+/g, " ").trim();
+  return prompt ? compactText(prompt, 80) : file.split(/[\\/]/).pop();
+}
+
+async function readSessionFile(file) {
+  return JSON.parse(await readFile(resolve(file), "utf8"));
+}
+
+async function listSessionSummaries() {
+  let names = [];
+  try {
+    names = await readdir(sessionDir);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+
+  const sessions = [];
+  for (const name of names.filter((entry) => entry.endsWith(".json"))) {
+    const file = join(sessionDir, name);
+    try {
+      const session = await readSessionFile(file);
+      sessions.push({
+        path: file,
+        title: sessionTitle(session, file),
+        createdAt: session.createdAt || "",
+        updatedAt: session.updatedAt || session.createdAt || "",
+        permission: session.config?.permission || "ask",
+        messageCount: Array.isArray(session.messages) ? session.messages.length : 0,
+        touchedFiles: session.touchedFiles || []
+      });
+    } catch {
+      // Ignore malformed sessions in the UI picker.
+    }
+  }
+  return sessions.sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""));
+}
+
+function formatToolCalls(calls) {
+  return (calls || []).map((call) => ({
+    id: call.id || "",
+    name: call.function?.name || "tool",
+    arguments: compactText(call.function?.arguments || "{}", 4000)
+  }));
+}
+
+function formatSessionMessages(session) {
+  return (session.messages || [])
+    .filter((message) => message.role !== "system")
+    .map((message, index) => ({
+      index,
+      role: message.role || "message",
+      content: compactText(message.content || "", message.role === "tool" ? 2200 : 4000),
+      reasoning: compactText(message.reasoning_content || "", 1800),
+      toolCallId: message.tool_call_id || "",
+      toolCalls: formatToolCalls(message.tool_calls)
+    }));
+}
+
+async function safeSession(path) {
+  const session = await readSessionFile(path);
+  return {
+    path,
+    title: sessionTitle(session, path),
+    createdAt: session.createdAt || "",
+    updatedAt: session.updatedAt || session.createdAt || "",
+    permission: session.config?.permission || "ask",
+    messageCount: Array.isArray(session.messages) ? session.messages.length : 0,
+    touchedFiles: session.touchedFiles || [],
+    messages: formatSessionMessages(session)
+  };
+}
+
+function newUiSessionPath(id) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return join(sessionDir, `${stamp}-${process.pid}-${id.slice(0, 8)}.json`);
+}
+
+function cliCommandArgs(promptFile, outputFile, permission, sessionPath, resume) {
   const args = [];
   if (cliScript) args.push(cliScript);
+  if (sessionPath) args.push("--session", sessionPath);
+  if (resume) args.push("--resume");
   args.push(
     "--prompt-file", promptFile,
     "--outfile", outputFile,
@@ -61,11 +151,13 @@ function parseOutput(markdown) {
   return { finalResponse, touchedFiles, markdown };
 }
 
-async function startRun({ prompt, permission = "review" }) {
+async function startRun({ prompt, permission = "review", sessionPath = "" }) {
   if (!prompt || typeof prompt !== "string") throw new Error("prompt is required.");
   if (!["review", "full"].includes(permission)) throw new Error("permission must be review or full.");
 
   const id = randomUUID();
+  const targetSession = sessionPath || newUiSessionPath(id);
+  const resume = Boolean(sessionPath);
   const dir = resolve(workspace, ".deepseek-watch", "ui", id);
   await mkdir(dir, { recursive: true });
   const promptFile = join(dir, "prompt.md");
@@ -76,6 +168,7 @@ async function startRun({ prompt, permission = "review" }) {
     id,
     prompt,
     permission,
+    sessionPath: targetSession,
     status: "running",
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -85,12 +178,13 @@ async function startRun({ prompt, permission = "review" }) {
     stderr: "",
     exitCode: null,
     finalResponse: "",
-    touchedFiles: []
+    touchedFiles: [],
+    session: null
   };
   runs.set(id, run);
   emitRuns();
 
-  const args = cliCommandArgs(promptFile, outputFile, permission);
+  const args = cliCommandArgs(promptFile, outputFile, permission, targetSession, resume);
   const child = spawn(cliExe, args, {
     cwd: workspace,
     windowsHide: true,
@@ -120,6 +214,8 @@ async function startRun({ prompt, permission = "review" }) {
     run.status = code === 0 ? "complete" : "error";
     try {
       Object.assign(run, parseOutput(await readFile(outputFile, "utf8")));
+      run.session = await safeSession(targetSession);
+      run.touchedFiles = run.session.touchedFiles || run.touchedFiles;
     } catch (error) {
       if (code === 0) run.status = "error";
       run.stderr += `\nCould not read output file: ${error.message}`;
@@ -137,6 +233,8 @@ function safeRun(run) {
     id: run.id,
     permission: run.permission,
     status: run.status,
+    sessionPath: run.sessionPath,
+    session: run.session,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
     outputFile: run.outputFile,
@@ -172,9 +270,17 @@ function startControlServer() {
           runs: runs.size
         });
       }
+      if (req.method === "GET" && url.pathname === "/sessions") {
+        return json(res, 200, await listSessionSummaries());
+      }
+      const sessionMatch = url.pathname.match(/^\/sessions\/(.+)$/);
+      if (req.method === "GET" && sessionMatch) {
+        const file = decodeURIComponent(sessionMatch[1]);
+        return json(res, 200, await safeSession(file));
+      }
       if (req.method === "POST" && url.pathname === "/chat") {
         const body = await readRequestJson(req);
-        const run = await startRun({ prompt: body.prompt, permission: body.permission || "review" });
+        const run = await startRun({ prompt: body.prompt, permission: body.permission || "review", sessionPath: body.sessionPath || "" });
         return json(res, 202, safeRun(run));
       }
       const runMatch = url.pathname.match(/^\/runs\/([^/]+)$/);
@@ -213,6 +319,8 @@ function createWindow() {
 ipcMain.handle("app:info", () => ({ workspace, controlPort, cdpPort }));
 ipcMain.handle("runs:list", () => Array.from(runs.values()).map(safeRun));
 ipcMain.handle("chat:start", async (_event, input) => safeRun(await startRun(input || {})));
+ipcMain.handle("sessions:list", () => listSessionSummaries());
+ipcMain.handle("sessions:read", (_event, path) => safeSession(path));
 
 app.whenReady().then(() => {
   startControlServer();
@@ -223,4 +331,3 @@ app.on("window-all-closed", () => {
   if (server) server.close();
   if (process.platform !== "darwin") app.quit();
 });
-

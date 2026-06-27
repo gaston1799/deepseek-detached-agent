@@ -122,14 +122,14 @@
       align-items: end;
     }
 
-    .runs {
+    .sessions, .runs {
       display: grid;
       gap: 8px;
       overflow: auto;
       padding-right: 2px;
     }
 
-    .run {
+    .session, .run {
       border: 1px solid var(--line);
       border-radius: 8px;
       background: var(--panel);
@@ -137,12 +137,12 @@
       cursor: pointer;
     }
 
-    .run.active {
+    .session.active, .run.active {
       border-color: var(--accent);
       background: #182331;
     }
 
-    .run-title {
+    .session-title, .run-title {
       display: flex;
       justify-content: space-between;
       gap: 12px;
@@ -187,6 +187,61 @@
       white-space: pre-wrap;
       line-height: 1.55;
       overflow-wrap: anywhere;
+    }
+
+    .history {
+      display: grid;
+      gap: 12px;
+    }
+
+    .message {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      overflow: hidden;
+    }
+
+    .message-header {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 9px 12px;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+
+    .message-body {
+      padding: 12px;
+      white-space: pre-wrap;
+      line-height: 1.5;
+      overflow-wrap: anywhere;
+    }
+
+    .message.user { border-color: #2b6b82; }
+    .message.assistant { border-color: #2d684a; }
+    .message.tool { border-color: #6c5b2a; }
+
+    details.tool-call {
+      margin-top: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #11151c;
+    }
+
+    details.tool-call summary {
+      cursor: pointer;
+      padding: 8px 10px;
+      color: var(--accent);
+      font-size: 13px;
+    }
+
+    details.tool-call pre {
+      border: 0;
+      border-top: 1px solid var(--line);
+      border-radius: 0;
+      max-height: 260px;
     }
 
     .files {
@@ -255,6 +310,11 @@
       </div>
 
       <section>
+        <h2>Sessions</h2>
+        <div class="sessions" id="sessions"></div>
+      </section>
+
+      <section>
         <h2>Runs</h2>
         <div class="runs" id="runs"></div>
       </section>
@@ -263,16 +323,16 @@
     <main>
       <div class="topbar">
         <div>
-          <h1 id="title">No run selected</h1>
-          <div class="run-meta" id="run-meta">Start a run or send one through the control API.</div>
+          <h1 id="title">No session selected</h1>
+          <div class="run-meta" id="run-meta">Select a session to resume it, or send a prompt to start a new one.</div>
         </div>
         <div class="status" id="status">idle</div>
       </div>
 
       <div class="content">
         <section>
-          <h2>Final Response</h2>
-          <div class="output" id="output">Waiting for a run.</div>
+          <h2>Chat History</h2>
+          <div class="history" id="history"></div>
         </section>
 
         <section>
@@ -298,8 +358,9 @@
     const promptEl = document.querySelector("#prompt");
     const permissionEl = document.querySelector("#permission");
     const sendEl = document.querySelector("#send");
+    const sessionsEl = document.querySelector("#sessions");
     const runsEl = document.querySelector("#runs");
-    const outputEl = document.querySelector("#output");
+    const historyEl = document.querySelector("#history");
     const filesEl = document.querySelector("#files");
     const stdoutEl = document.querySelector("#stdout");
     const stderrEl = document.querySelector("#stderr");
@@ -309,7 +370,10 @@
     const metaEl = document.querySelector("#meta");
 
     let runs = [];
-    let selectedId = null;
+    let sessions = [];
+    let selectedRunId = null;
+    let selectedSessionPath = "";
+    let currentSession = null;
 
     function shortId(id) {
       return id ? id.slice(0, 8) : "";
@@ -323,7 +387,7 @@
       }
       for (const run of runs) {
         const item = document.createElement("div");
-        item.className = `run ${run.id === selectedId ? "active" : ""}`;
+        item.className = `run ${run.id === selectedRunId ? "active" : ""}`;
         item.innerHTML = `
           <div class="run-title">
             <span>${shortId(run.id)}</span>
@@ -332,45 +396,127 @@
           <div class="run-meta">${run.permission} · ${new Date(run.createdAt).toLocaleTimeString()}</div>
         `;
         item.addEventListener("click", () => {
-          selectedId = run.id;
+          selectedRunId = run.id;
+          selectedSessionPath = run.sessionPath || selectedSessionPath;
+          if (run.session) currentSession = run.session;
           render();
         });
         runsEl.appendChild(item);
       }
     }
 
-    function renderRun(run) {
-      if (!run) {
-        titleEl.textContent = "No run selected";
-        runMetaEl.textContent = "Start a run or send one through the control API.";
+    function renderSessions() {
+      sessionsEl.innerHTML = "";
+      if (!sessions.length) {
+        sessionsEl.innerHTML = '<div class="meta">No saved sessions.</div>';
+        return;
+      }
+      for (const session of sessions) {
+        const item = document.createElement("div");
+        item.className = `session ${session.path === selectedSessionPath ? "active" : ""}`;
+        item.innerHTML = `
+          <div class="session-title">
+            <span>${escapeHtml(session.title || "Session")}</span>
+            <span>${session.messageCount}</span>
+          </div>
+          <div class="run-meta">${session.permission} · ${session.updatedAt ? new Date(session.updatedAt).toLocaleString() : "unknown"}</div>
+        `;
+        item.addEventListener("click", async () => {
+          selectedRunId = null;
+          selectedSessionPath = session.path;
+          currentSession = await window.deepseekUi.readSession(session.path);
+          permissionEl.value = ["review", "full"].includes(currentSession.permission) ? currentSession.permission : "review";
+          render();
+        });
+        sessionsEl.appendChild(item);
+      }
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;"
+      }[ch]));
+    }
+
+    function renderMessages(session) {
+      historyEl.innerHTML = "";
+      if (!session?.messages?.length) {
+        historyEl.innerHTML = '<div class="output">No chat history yet.</div>';
+        return;
+      }
+      for (const message of session.messages) {
+        const el = document.createElement("article");
+        el.className = `message ${message.role}`;
+        const toolCalls = (message.toolCalls || []).map((call) => `
+          <details class="tool-call">
+            <summary>${escapeHtml(call.name)}</summary>
+            <pre>${escapeHtml(call.arguments)}</pre>
+          </details>
+        `).join("");
+        const reasoning = message.reasoning ? `<details class="tool-call"><summary>reasoning</summary><pre>${escapeHtml(message.reasoning)}</pre></details>` : "";
+        el.innerHTML = `
+          <div class="message-header">
+            <span>${escapeHtml(message.role)}${message.toolCallId ? ` · ${escapeHtml(message.toolCallId)}` : ""}</span>
+            <span>#${message.index + 1}</span>
+          </div>
+          <div class="message-body">${escapeHtml(message.content || "(empty)")}${reasoning}${toolCalls}</div>
+        `;
+        historyEl.appendChild(el);
+      }
+    }
+
+    function renderSelected() {
+      const run = runs.find((item) => item.id === selectedRunId);
+      const session = run?.session || currentSession;
+      if (!run && !session) {
+        titleEl.textContent = "No session selected";
+        runMetaEl.textContent = "Select a session to resume it, or send a prompt to start a new one.";
         statusEl.textContent = "idle";
         statusEl.className = "status";
-        outputEl.textContent = "Waiting for a run.";
+        historyEl.innerHTML = '<div class="output">No chat history yet.</div>';
         filesEl.innerHTML = "";
         stdoutEl.textContent = "";
         stderrEl.textContent = "";
         return;
       }
-      titleEl.textContent = `Run ${shortId(run.id)}`;
-      runMetaEl.textContent = `${run.outputFile} · exit ${run.exitCode ?? "pending"}`;
-      statusEl.textContent = run.status;
-      statusEl.className = `status ${run.status}`;
-      outputEl.textContent = run.finalResponse || (run.status === "running" ? "Running..." : "No final response.");
+      titleEl.textContent = session?.title || `Run ${shortId(run.id)}`;
+      runMetaEl.textContent = `${session?.path || run.sessionPath || run.outputFile} ${run ? `· exit ${run.exitCode ?? "pending"}` : ""}`;
+      statusEl.textContent = run?.status || "ready";
+      statusEl.className = `status ${run?.status || "complete"}`;
+      renderMessages(session || { messages: [{ role: "assistant", content: run.finalResponse || "Running...", index: 0 }] });
       filesEl.innerHTML = "";
-      for (const file of run.touchedFiles || []) {
+      for (const file of session?.touchedFiles || run?.touchedFiles || []) {
         const chip = document.createElement("span");
         chip.className = "file";
         chip.textContent = file;
         filesEl.appendChild(chip);
       }
       if (!filesEl.children.length) filesEl.innerHTML = '<span class="meta">None</span>';
-      stdoutEl.textContent = run.stdoutTail || "";
-      stderrEl.textContent = run.stderrTail || "";
+      stdoutEl.textContent = run?.stdoutTail || "";
+      stderrEl.textContent = run?.stderrTail || "";
     }
 
     function render() {
+      renderSessions();
       renderRuns();
-      renderRun(runs.find((run) => run.id === selectedId) || runs[0]);
+      renderSelected();
+    }
+
+    async function refreshSessions() {
+      sessions = await window.deepseekUi.listSessions();
+      if (selectedSessionPath) {
+        const stillExists = sessions.some((session) => session.path === selectedSessionPath);
+        if (stillExists) currentSession = await window.deepseekUi.readSession(selectedSessionPath);
+      } else if (sessions[0]) {
+        selectedSessionPath = sessions[0].path;
+        currentSession = await window.deepseekUi.readSession(selectedSessionPath);
+        permissionEl.value = ["review", "full"].includes(currentSession.permission) ? currentSession.permission : "review";
+      }
+      render();
     }
 
     async function startRun() {
@@ -378,9 +524,12 @@
       try {
         const run = await window.deepseekUi.startChat({
           prompt: promptEl.value,
-          permission: permissionEl.value
+          permission: permissionEl.value,
+          sessionPath: selectedSessionPath
         });
-        selectedId = run.id;
+        selectedRunId = run.id;
+        selectedSessionPath = run.sessionPath || selectedSessionPath;
+        if (run.session) currentSession = run.session;
       } finally {
         sendEl.disabled = false;
       }
@@ -395,16 +544,19 @@
       runs = initial;
       render();
     });
+    refreshSessions();
     window.deepseekUi.onRuns((next) => {
       runs = next;
-      if (!selectedId && runs[0]) selectedId = runs[0].id;
       render();
     });
     window.deepseekUi.onRun((run) => {
       runs = runs.map((item) => item.id === run.id ? run : item);
       if (!runs.some((item) => item.id === run.id)) runs.unshift(run);
-      selectedId = selectedId || run.id;
+      selectedRunId = run.id;
+      selectedSessionPath = run.sessionPath || selectedSessionPath;
+      if (run.session) currentSession = run.session;
       render();
+      refreshSessions();
     });
   </script>
 </body>

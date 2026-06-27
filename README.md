@@ -110,10 +110,13 @@ d -ui --ui-port 17891 --ui-cdp-port 9223
 - UI control API: `http://127.0.0.1:17891`
 - CDP / remote debugging: `http://127.0.0.1:9223`
 - Health check: `GET /health`
+- List saved sessions: `GET /sessions`
+- Read a saved session: `GET /sessions/<url-encoded-session-path>`
 - Start a run: `POST /chat` with `{"prompt":"...","permission":"review"}` or `{"permission":"full"}`
+- Resume a session from the API: include `{"sessionPath":"C:\\path\\to\\session.json"}` in `POST /chat`
 - Inspect runs: `GET /runs` and `GET /runs/<id>`
 
-The UI delegates chat execution back to the existing `d` CLI and writes run output under `.deepseek-watch/ui/<run-id>/`.
+The UI delegates chat execution back to the existing `d` CLI, reads the same `.deepseek-watch/sessions/*.json` files as the TUI, renders chat history/tool calls/tool results, and writes per-run output under `.deepseek-watch/ui/<run-id>/`.
 
 ---
 

@@ -3,6 +3,8 @@ const { contextBridge, ipcRenderer } = require("electron");
 contextBridge.exposeInMainWorld("deepseekUi", {
   info: () => ipcRenderer.invoke("app:info"),
   listRuns: () => ipcRenderer.invoke("runs:list"),
+  listSessions: () => ipcRenderer.invoke("sessions:list"),
+  readSession: (path) => ipcRenderer.invoke("sessions:read", path),
   startChat: (input) => ipcRenderer.invoke("chat:start", input),
   onRuns: (handler) => {
     const listener = (_event, runs) => handler(runs);
@@ -15,4 +17,3 @@ contextBridge.exposeInMainWorld("deepseekUi", {
     return () => ipcRenderer.off("run:update", listener);
   }
 });
-
