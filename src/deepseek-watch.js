@@ -1491,7 +1491,7 @@ function toolSchemas(opts) {
           type: "object",
           properties: {
             pattern:          { type: "string",  description: "Regex or literal string to search for." },
-            path:             { type: "string",  description: "Workspace-relative subdirectory to scope the search." },
+            path:             { type: "string",  description: "Workspace-relative file or subdirectory to scope the search." },
             glob:             { type: "string",  description: "File filter glob, e.g. '*.ts' or 'src/**/*.js'." },
             ignore_case:      { type: "boolean", description: "Case-insensitive match. Default false." },
             max_results:      { type: "number",  description: "Max matches to return. Default 200." },
@@ -2432,6 +2432,12 @@ async function runTool(opts, name, args) {
     catch { searchRe = new RegExp(escapeRegex(pattern), args.ignore_case ? "i" : ""); }
     const workspaceRoot = resolve(process.cwd());
     const searchRoot = args.path ? assertInsideWorkspace(args.path) : workspaceRoot;
+    let searchRootInfo;
+    try {
+      searchRootInfo = await stat(searchRoot);
+    } catch {
+      throw new Error(`search path does not exist: ${args.path}`);
+    }
     const maxResults = Math.min(Number(args.max_results) || 200, 1000);
     const contextLines = Math.min(Math.max(Number(args.context_lines) || 0, 0), 5);
     const globRx = args.glob ? globToRegex(args.glob) : null;
@@ -2440,7 +2446,10 @@ async function runTool(opts, name, args) {
       ? userExcludes
       : [...DEFAULT_TRAVERSE_EXCLUDES, ...userExcludes];
     const results = [];
-    outer: for await (const item of walkDir(workspaceRoot, searchRoot, { excludeDirNames, type: "file" })) {
+    const searchItems = searchRootInfo.isFile()
+      ? [{ absPath: searchRoot, relPath: relative(workspaceRoot, searchRoot).replace(/\\/g, "/"), isDir: false }]
+      : walkDir(workspaceRoot, searchRoot, { excludeDirNames, type: "file" });
+    outer: for await (const item of searchItems) {
       if (globRx && !globRx.test(item.relPath) && !globRx.test(item.relPath.split("/").pop())) continue;
       if (await isBinaryFile(item.absPath)) continue;
       let text;
