@@ -118,6 +118,10 @@ d -ui --ui-port 17891 --ui-cdp-port 9223
 
 The UI delegates chat execution back to the existing `d` CLI, reads the same `.deepseek-watch/sessions/*.json` files as the TUI, renders chat history/tool calls/tool results, and writes per-run output under `.deepseek-watch/ui/<run-id>/`.
 
+![Electron UI showing saved session history](docs/images/electron-session-history.png)
+
+![Electron UI with independently scrollable chat history](docs/images/electron-scrollable-chat.png)
+
 ---
 
 ## Workspace tools
