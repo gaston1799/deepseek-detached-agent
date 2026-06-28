@@ -157,8 +157,9 @@ In terminals that support OSC-8 hyperlinks, the TUI turns exact workspace file p
 | `checkpoint_session` | Append a compact checkpoint to the saved session |
 | `summarize_session` | Compact recent session summary |
 | `handoff_status` / `handoff_wait` | Inspect or wait for delegated handoff output files |
-| `web_search` | Web search via Brave (with `BRAVE_SEARCH_API_KEY`) or DuckDuckGo HTML/Lite |
+| `web_search` | Web search via Google Custom Search when configured, then Brave, then DuckDuckGo HTML/Lite |
 | `web_fetch` | Fetch a URL and return readable page text with chunk offsets |
+| `web_find` | Fetch a URL and run a JavaScript regexp over readable page text |
 
 ### Write tools (ask, full)
 
@@ -336,6 +337,8 @@ dswait out.md --timeout 120000   # wait up to 2 min
 
 ```bash
 dsw config set-key <key>   # save to %APPDATA%\deepseek-detached-agent\config.json
+dsw config set-google-search-key <key>
+dsw config set-google-search-engine-id <engine-id>
 dsw config path            # show config file location
 ```
 
@@ -345,9 +348,17 @@ Environment variables (take priority over saved config):
 DEEPSEEK_API_KEY=sk-...
 DEEPSEEK_MODEL=deepseek-v4-flash
 DEEPSEEK_BASE_URL=https://api.deepseek.com
+GOOGLE_SEARCH_API_KEY=...
+GOOGLE_SEARCH_ENGINE_ID=...
+WEB_SEARCH_PROVIDER=auto
+BRAVE_SEARCH_API_KEY=...
 CLAUDE_CMD=claude
 NO_COLOR=1
 ```
+
+`WEB_SEARCH_PROVIDER=auto` uses Google when `GOOGLE_SEARCH_API_KEY` and `GOOGLE_SEARCH_ENGINE_ID` are set, then Brave when `BRAVE_SEARCH_API_KEY` is set, then DuckDuckGo as the no-key fallback. Use `WEB_SEARCH_PROVIDER=google` to force Google and fail clearly when it is not configured.
+
+If Google returns an access error such as `This project does not have the access to Custom Search JSON API`, `auto` mode reports the Google failure and continues with the next provider. This can happen even after the API is enabled if Google has not granted the project access to Custom Search JSON API.
 
 ---
 

@@ -29,6 +29,8 @@ Usage:
   dsw doctor
   dsw config set-key <key>
   dsw config set-openai-key <key>
+  dsw config set-google-search-key <key>
+  dsw config set-google-search-engine-id <engine-id>
   dsw config path
   dsw -p <prompt> [options]
   dsw --prompt-file <file> [options]
@@ -339,6 +341,7 @@ function runtimeContext() {
   const branch = gitBranch();
   const openAiConfigured = Boolean(process.env.OPENAI_API_KEY);
   const openAiModel = process.env.OPENAI_VISION_MODEL || "gpt-4.1-mini";
+  const searchProviders = configuredSearchProviders();
   return [
     `date: ${new Date().toISOString()}`,
     `device_os: ${platform()} ${release()} ${arch()}`,
@@ -349,6 +352,9 @@ function runtimeContext() {
     `openai_vision: ${openAiConfigured ? "configured" : "not_configured"}`,
     `openai_vision_model: ${openAiModel}`,
     "openai_api_key_setup: https://platform.openai.com/api-keys",
+    `web_search_default: ${selectedSearchProvider()}`,
+    `web_search_providers: ${searchProviders.join(", ")}`,
+    "google_search_setup: https://programmablesearchengine.google.com/controlpanel/all",
     branch ? `git_branch: ${branch}` : "git_branch: none"
   ].join("\n");
 }
@@ -927,6 +933,24 @@ function formatSearchResults(provider, query, results) {
   return lines.join("\n").trimEnd();
 }
 
+function googleSearchConfigured() {
+  return Boolean(process.env.GOOGLE_SEARCH_API_KEY && (process.env.GOOGLE_SEARCH_ENGINE_ID || process.env.GOOGLE_CSE_ID));
+}
+
+function configuredSearchProviders() {
+  const providers = [];
+  if (googleSearchConfigured()) providers.push("google");
+  if (process.env.BRAVE_SEARCH_API_KEY) providers.push("brave");
+  providers.push("duckduckgo");
+  return providers;
+}
+
+function selectedSearchProvider() {
+  const provider = String(process.env.WEB_SEARCH_PROVIDER || "auto").trim().toLowerCase();
+  if (provider && provider !== "auto") return provider;
+  return configuredSearchProviders()[0] || "duckduckgo";
+}
+
 async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -1020,39 +1044,101 @@ async function braveSearch(query, maxResults) {
   return formatSearchResults("Brave Search", query, results);
 }
 
+async function googleSearch(query, maxResults) {
+  const key = process.env.GOOGLE_SEARCH_API_KEY;
+  const cx = process.env.GOOGLE_SEARCH_ENGINE_ID || process.env.GOOGLE_CSE_ID;
+  if (!key || !cx) return null;
+  const url = new URL("https://www.googleapis.com/customsearch/v1");
+  url.searchParams.set("key", key);
+  url.searchParams.set("cx", cx);
+  url.searchParams.set("q", query);
+  url.searchParams.set("num", String(Math.min(maxResults, 10)));
+  const response = await fetchWithTimeout(url, {
+    headers: {
+      "Accept": "application/json",
+      "User-Agent": "deepseek-detached-agent"
+    }
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message = data.error?.message || `HTTP ${response.status}`;
+    throw new Error(`Google Custom Search failed: ${message}`);
+  }
+  const results = (data.items || []).slice(0, maxResults).map((item) => ({
+    title: stripHtml(item.title),
+    url: item.link,
+    snippet: stripHtml(item.snippet)
+  }));
+  return formatSearchResults("Google Custom Search", query, results);
+}
+
 async function webSearch(args) {
   const query = String(args.query || "").trim();
   if (!query) throw new Error("query must be a non-empty string.");
   const maxResults = Math.min(Math.max(Number(args.max_results) || 5, 1), 10);
   const site = String(args.site || "").trim();
   const scopedQuery = site ? `${query} site:${site}` : query;
-  const brave = await braveSearch(scopedQuery, maxResults);
-  if (brave) return brave;
+  const requestedProvider = String(args.provider || process.env.WEB_SEARCH_PROVIDER || "auto").trim().toLowerCase();
+  if (requestedProvider === "google") {
+    const google = await googleSearch(scopedQuery, maxResults);
+    if (!google) throw new Error("Google search is not configured. Set GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_ENGINE_ID, or run dsw config set-google-search-key and dsw config set-google-search-engine-id.");
+    return google;
+  }
+  if (requestedProvider === "brave") {
+    const brave = await braveSearch(scopedQuery, maxResults);
+    if (!brave) throw new Error("Brave search is not configured. Set BRAVE_SEARCH_API_KEY.");
+    return brave;
+  }
+  if (requestedProvider !== "auto" && requestedProvider !== "duckduckgo") {
+    throw new Error("provider must be one of: auto, google, brave, duckduckgo.");
+  }
+  if (requestedProvider === "auto") {
+    const fallbackNotes = [];
+    try {
+      const google = await googleSearch(scopedQuery, maxResults);
+      if (google) return google;
+    } catch (error) {
+      fallbackNotes.push(`Google Custom Search unavailable: ${error.message}`);
+    }
+    try {
+      const brave = await braveSearch(scopedQuery, maxResults);
+      if (brave) {
+        return fallbackNotes.length ? `${fallbackNotes.join("\n")}\n\n${brave}` : brave;
+      }
+    } catch (error) {
+      fallbackNotes.push(`Brave Search unavailable: ${error.message}`);
+    }
+    const duck = await duckDuckGoSearch(scopedQuery, maxResults, args.time_range);
+    return fallbackNotes.length ? `${fallbackNotes.join("\n")}\n\n${duck}` : duck;
+  }
   return duckDuckGoSearch(scopedQuery, maxResults, args.time_range);
 }
 
-async function webFetch(args) {
-  const rawUrl = String(args.url || "").trim();
-  if (!rawUrl) throw new Error("url must be a non-empty string.");
+async function fetchReadableUrl(rawUrl, timeoutMs = 20000) {
   const url = new URL(rawUrl);
   if (!["http:", "https:"].includes(url.protocol)) throw new Error("url must use http or https.");
-
-  const maxChars = Math.min(Math.max(Number(args.max_chars) || 12000, 1000), 50000);
-  const offset = Math.max(Number(args.offset) || 0, 0);
   const response = await fetchWithTimeout(url, {
     headers: {
       "Accept": "text/html, text/plain, application/xhtml+xml, application/xml;q=0.9, */*;q=0.5",
       "User-Agent": "Mozilla/5.0 deepseek-detached-agent"
     }
-  }, Math.min(Number(args.timeout_ms) || 20000, 60000));
+  }, Math.min(Number(timeoutMs) || 20000, 60000));
   if (!response.ok) throw new Error(`Fetch failed: HTTP ${response.status}`);
-
   const contentType = response.headers.get("content-type") || "";
   const raw = await response.text();
   const text = /html|xml|xhtml/i.test(contentType) || /<html|<!doctype html/i.test(raw)
     ? htmlToText(raw)
     : raw.replace(/\r\n/g, "\n").trim();
   const title = /html|xhtml/i.test(contentType) ? htmlTitle(raw) : "";
+  return { url, contentType, raw, text, title };
+}
+
+async function webFetch(args) {
+  const rawUrl = String(args.url || "").trim();
+  if (!rawUrl) throw new Error("url must be a non-empty string.");
+  const maxChars = Math.min(Math.max(Number(args.max_chars) || 12000, 1000), 50000);
+  const offset = Math.max(Number(args.offset) || 0, 0);
+  const { url, contentType, text, title } = await fetchReadableUrl(rawUrl, args.timeout_ms);
   const chunk = text.slice(offset, offset + maxChars);
   const nextOffset = offset + maxChars < text.length ? offset + maxChars : null;
 
@@ -1073,6 +1159,50 @@ async function webFetch(args) {
   lines.push("", chunk || "(no readable text)");
   if (nextOffset != null) lines.push("", `[chunk ${offset}-${offset + chunk.length} of ${text.length} chars; continue with offset ${nextOffset}]`);
   return lines.join("\n");
+}
+
+async function webFind(args) {
+  const rawUrl = String(args.url || "").trim();
+  if (!rawUrl) throw new Error("url must be a non-empty string.");
+  const pattern = String(args.pattern || "");
+  if (!pattern) throw new Error("pattern must be a non-empty regex pattern string.");
+  const flags = String(args.flags || "i").replace(/[^dgimsuvy]/g, "");
+  const safeFlags = flags.includes("g") ? flags : `${flags}g`;
+  const contextChars = Math.min(Math.max(Number(args.context_chars) || 160, 0), 1000);
+  const maxResults = Math.min(Math.max(Number(args.max_results) || 20, 1), 100);
+  const maxChars = Math.min(Math.max(Number(args.max_chars) || 50000, 1000), 250000);
+  const { url, contentType, text, title } = await fetchReadableUrl(rawUrl, args.timeout_ms);
+  const haystack = text.slice(0, maxChars);
+  let regex;
+  try {
+    regex = new RegExp(pattern, safeFlags);
+  } catch (error) {
+    throw new Error(`Invalid regex pattern: ${error.message}`);
+  }
+  const matches = [];
+  let match;
+  while ((match = regex.exec(haystack)) && matches.length < maxResults) {
+    const start = match.index;
+    const end = start + match[0].length;
+    const before = haystack.slice(Math.max(0, start - contextChars), start);
+    const after = haystack.slice(end, Math.min(haystack.length, end + contextChars));
+    matches.push({
+      match: match[0],
+      offset: start,
+      context: `${before}${match[0]}${after}`.replace(/\s+/g, " ").trim()
+    });
+    if (match[0] === "") regex.lastIndex += 1;
+  }
+  return JSON.stringify({
+    url: url.href,
+    title,
+    content_type: contentType,
+    pattern,
+    flags: safeFlags,
+    searched_chars: haystack.length,
+    total_chars: text.length,
+    matches
+  }, null, 2);
 }
 
 const IMAGE_MIME_BY_EXT = new Map([
@@ -1520,16 +1650,38 @@ function toolSchemas(opts) {
       type: "function",
       function: {
         name: "web_search",
-        description: "Search the web for current or external information. Read-only. Uses BRAVE_SEARCH_API_KEY when set, otherwise DuckDuckGo HTML/Lite results.",
+        description: "Search the web for current or external information. Read-only. Uses Google Custom Search when configured, then Brave when configured, otherwise DuckDuckGo HTML/Lite results.",
         parameters: {
           type: "object",
           properties: {
             query: { type: "string", description: "Search query." },
             max_results: { type: "number", description: "Number of results to return, 1-10. Defaults to 5." },
             site: { type: "string", description: "Optional domain to restrict results, e.g. github.com." },
+            provider: { type: "string", enum: ["auto", "google", "brave", "duckduckgo"], description: "Optional search provider override. Defaults to WEB_SEARCH_PROVIDER or auto." },
             time_range: { type: "string", enum: ["day", "week", "month", "year"], description: "Optional freshness hint for DuckDuckGo fallback." }
           },
           required: ["query"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "web_find",
+        description: "Fetch a URL, extract readable text, and run a JavaScript regular expression over the page text. Use for exact terms, dates, errors, API names, code symbols, or citations inside a page. Read-only.",
+        parameters: {
+          type: "object",
+          properties: {
+            url: { type: "string", description: "HTTP or HTTPS URL to fetch and search." },
+            pattern: { type: "string", description: "JavaScript regular expression pattern." },
+            flags: { type: "string", description: "JavaScript regex flags. Defaults to i; g is added automatically." },
+            context_chars: { type: "number", description: "Characters of context around each match. Default 160, max 1000." },
+            max_results: { type: "number", description: "Maximum matches to return. Default 20, max 100." },
+            max_chars: { type: "number", description: "Maximum page text characters to search. Default 50000, max 250000." },
+            timeout_ms: { type: "number", description: "Fetch timeout in milliseconds. Default 20000, max 60000." }
+          },
+          required: ["url", "pattern"],
           additionalProperties: false
         }
       }
@@ -2269,6 +2421,9 @@ function setUserEnvironmentVariable(name, value) {
 async function doctor() {
   const deepSeekKey = await getDeepSeekApiKey();
   const openAiKey = process.env.OPENAI_API_KEY || "";
+  const googleSearchKey = process.env.GOOGLE_SEARCH_API_KEY || "";
+  const googleSearchEngineId = process.env.GOOGLE_SEARCH_ENGINE_ID || process.env.GOOGLE_CSE_ID || "";
+  const braveSearchKey = process.env.BRAVE_SEARCH_API_KEY || "";
   const skills = await discoverSkills({});
   const dswStatus = commandStatus("dsw", ["--help"]);
   const pbcStatus = commandStatus("pbc", ["--help"]);
@@ -2291,6 +2446,16 @@ async function doctor() {
     "  Billing/limits: https://platform.openai.com/settings/organization/billing/overview",
     "  Current terminal: $env:OPENAI_API_KEY = \"sk-proj-...\"",
     "  Persist for new terminals: dsw config set-openai-key <openai-key>",
+    "",
+    "Web search",
+    `  default provider: ${selectedSearchProvider()}`,
+    `  available providers: ${configuredSearchProviders().join(", ")}`,
+    `  GOOGLE_SEARCH_API_KEY: ${maskedSecretStatus(googleSearchKey)}`,
+    `  GOOGLE_SEARCH_ENGINE_ID: ${googleSearchEngineId ? "set" : "not set"}`,
+    `  BRAVE_SEARCH_API_KEY: ${maskedSecretStatus(braveSearchKey)}`,
+    "  Google setup: https://programmablesearchengine.google.com/controlpanel/all",
+    "  Persist Google key: dsw config set-google-search-key <google-api-key>",
+    "  Persist Google engine: dsw config set-google-search-engine-id <engine-id>",
     "",
     "CLI",
     `  dsw on PATH: ${dswStatus.ok ? "yes" : "no"}`,
@@ -2656,6 +2821,10 @@ async function runTool(opts, name, args) {
 
   if (name === "web_fetch") {
     return webFetch(args);
+  }
+
+  if (name === "web_find") {
+    return webFind(args);
   }
 
   if (name === "view_image") {
@@ -3333,11 +3502,19 @@ async function run() {
       process.stdout.write(`${setUserEnvironmentVariable("OPENAI_API_KEY", argv[2] || "")}\n`);
       return;
     }
+    if (command === "set-google-search-key") {
+      process.stdout.write(`${setUserEnvironmentVariable("GOOGLE_SEARCH_API_KEY", argv[2] || "")}\n`);
+      return;
+    }
+    if (command === "set-google-search-engine-id") {
+      process.stdout.write(`${setUserEnvironmentVariable("GOOGLE_SEARCH_ENGINE_ID", argv[2] || "")}\n`);
+      return;
+    }
     if (command === "path") {
       process.stdout.write(`${configPath()}\n`);
       return;
     }
-    throw new Error("Unknown config command. Use: dsw config set-key <key> or dsw config set-openai-key <key>");
+    throw new Error("Unknown config command. Use: dsw config set-key <key>, dsw config set-openai-key <key>, dsw config set-google-search-key <key>, or dsw config set-google-search-engine-id <engine-id>");
   }
 
   const opts = argv.length === 0 ? await dashboardOpts() : parseArgs(argv);
