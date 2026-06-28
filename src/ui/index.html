@@ -24,7 +24,8 @@
 
     body {
       margin: 0;
-      min-height: 100vh;
+      height: 100vh;
+      overflow: hidden;
       background: var(--bg);
       color: var(--text);
     }
@@ -32,7 +33,8 @@
     .app {
       display: grid;
       grid-template-columns: minmax(320px, 390px) minmax(0, 1fr);
-      min-height: 100vh;
+      height: 100vh;
+      min-height: 0;
     }
 
     aside {
@@ -42,12 +44,14 @@
       display: flex;
       flex-direction: column;
       gap: 16px;
+      min-height: 0;
     }
 
     main {
       display: grid;
       grid-template-rows: auto minmax(0, 1fr);
       min-width: 0;
+      min-height: 0;
     }
 
     h1, h2 {
@@ -127,6 +131,7 @@
       gap: 8px;
       overflow: auto;
       padding-right: 2px;
+      min-height: 0;
     }
 
     .session, .run {
@@ -171,11 +176,23 @@
 
     .content {
       min-width: 0;
-      overflow: auto;
+      min-height: 0;
+      overflow: hidden;
       padding: 22px;
       display: grid;
+      grid-template-rows: minmax(0, 1fr) auto auto;
       gap: 18px;
-      align-content: start;
+    }
+
+    .content > section {
+      min-width: 0;
+    }
+
+    .chat-section {
+      min-height: 0;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      gap: 8px;
     }
 
     .output {
@@ -190,8 +207,13 @@
     }
 
     .history {
-      display: grid;
+      display: flex;
+      flex-direction: column;
       gap: 12px;
+      min-height: 0;
+      overflow-y: auto;
+      padding-right: 8px;
+      scroll-behavior: smooth;
     }
 
     .message {
@@ -199,6 +221,7 @@
       border-radius: 8px;
       background: var(--panel);
       overflow: hidden;
+      flex: 0 0 auto;
     }
 
     .message-header {
@@ -330,7 +353,7 @@
       </div>
 
       <div class="content">
-        <section>
+        <section class="chat-section">
           <h2>Chat History</h2>
           <div class="history" id="history"></div>
         </section>
@@ -374,6 +397,7 @@
     let selectedRunId = null;
     let selectedSessionPath = "";
     let currentSession = null;
+    let renderedHistoryKey = "";
 
     function shortId(id) {
       return id ? id.slice(0, 8) : "";
@@ -442,10 +466,35 @@
       }[ch]));
     }
 
+    function isHistoryNearBottom() {
+      return historyEl.scrollHeight - historyEl.scrollTop - historyEl.clientHeight < 80;
+    }
+
+    function maybeScrollHistory(shouldScroll, smooth = true) {
+      if (!shouldScroll) return;
+      requestAnimationFrame(() => {
+        historyEl.scrollTo({
+          top: historyEl.scrollHeight,
+          behavior: smooth ? "smooth" : "auto"
+        });
+      });
+    }
+
     function renderMessages(session) {
+      const historyKey = [
+        session?.path || "",
+        session?.updatedAt || "",
+        session?.messages?.length || 0,
+        session?.messages?.at(-1)?.content || "",
+        session?.messages?.at(-1)?.toolCalls?.length || 0
+      ].join("|");
+      if (historyKey === renderedHistoryKey) return;
+      renderedHistoryKey = historyKey;
+      const shouldStickToBottom = isHistoryNearBottom();
       historyEl.innerHTML = "";
       if (!session?.messages?.length) {
         historyEl.innerHTML = '<div class="output">No chat history yet.</div>';
+        maybeScrollHistory(shouldStickToBottom, false);
         return;
       }
       for (const message of session.messages) {
@@ -467,12 +516,14 @@
         `;
         historyEl.appendChild(el);
       }
+      maybeScrollHistory(shouldStickToBottom);
     }
 
     function renderSelected() {
       const run = runs.find((item) => item.id === selectedRunId);
       const session = run?.session || currentSession;
       if (!run && !session) {
+        renderedHistoryKey = "";
         titleEl.textContent = "No session selected";
         runMetaEl.textContent = "Select a session to resume it, or send a prompt to start a new one.";
         statusEl.textContent = "idle";
