@@ -34,13 +34,13 @@
 
 ## DeepSeek skills system (Codex-style skills for dsw)
 
-- [ ] Design and implement a DeepSeek-native skills storage/discovery format, mirroring how Codex stores skills.
+- [x] Design and implement a DeepSeek-native skills storage/discovery format, mirroring how Codex stores skills.
   - Codex uses `~/.codex/skills/<name>/SKILL.md` with `name` + `description` frontmatter and an injected skills index per prompt. The DeepSeek version should have its own root (e.g. `~/.deepseek/skills/` or `~/.deepseek-agent-watch/skills/`) with the same SKILL.md convention so it is discoverable no matter the working directory.
   - Decide compatibility: keep reading `~/.codex/skills` and workspace `.deepseek-watch/skills` as fallback sources, but make the DeepSeek root canonical for `dsw`-managed skills.
   - Define the index format (title, description, path, source, enabled) that the wrapper injects into the system prompt, and the discovery precedence (skill-root flag > DEEPSEEK_SKILLS_DIR > `~/.deepseek/skills` > `~/.codex/skills` > workspace `.deepseek-watch/skills`).
-- [ ] Update the DeepSeek CLI (`dsw`/`d`) with a `skill` command group.
+- [x] Update the DeepSeek CLI (`dsw`/`d`) with a `skill` command group.
   - `dsw skill list`, `dsw skill read <name>`, `dsw skill install <name|repo|path>`, `dsw skill create <name>`, `dsw skill remove <name>`, `dsw skill sync` (workspace ↔ global), and `dsw skill doctor` for broken/duplicate skills.
   - Support installing a skill from a local path, a workspace `.deepseek-watch/skills` entry, or a GitHub repo (like `codex skill install` / the skill-installer flow).
   - Add a `--skill-root`/`DEEPSEEK_SKILLS_DIR` override consistent with existing flag/env behavior, and surface loaded skills in `dsw doctor`.
   - Migration path: optionally copy existing `~/.codex/skills/*` into the DeepSeek root with a `--migrate-from-codex` flag (never mutate `~/.codex/skills`).
-  - Tests: index injection (frontmatter parsing, malformed SKILL.md), precedence order, install/sync round-trip, and a regression that a skill added mid-session is picked up on the next run.
+  - [x] Tests: index injection (frontmatter parsing, malformed SKILL.md), precedence order, install/sync round-trip, and a regression that a skill added mid-session is picked up on the next run (`npm run test:skills`).

@@ -6,3 +6,6 @@ out/
 tmp/
 dist/
 .deepseek-watch/
+
+.codex-handoffs/
+

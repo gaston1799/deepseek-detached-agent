@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { deepSeekHttpError } from "./api-error.js";
 import { getDeepSeekApiKey } from "./config.js";
 import { applyThinkingOptions } from "./deepseek-request.js";
+import { isRetryableFetchError, retryBackoffMs } from "./fetch-retry.js";
 
 const DEFAULT_BASE_URL = "https://api.deepseek.com";
 const DEFAULT_MODEL = "deepseek-v4-flash";
@@ -30,6 +31,9 @@ Options:
                             DeepSeek thinking toggle. Default: enabled
   --max-tokens <number>     Max output tokens. Default: 8192
   --timeout <ms>            DeepSeek request timeout. Default: 600000
+  --retry-attempts <number> Max retries for transient fetch failures (0 = keep retrying forever). Default: 0
+  --retry-delay <ms>        Initial retry backoff, doubles per attempt. Default: 1000
+  --retry-max-delay <ms>    Retry backoff cap. Default: 30000
   --detach                  Spawn a detached worker and return immediately.
   --no-fallback             Do not fall back to claude -p.
   --claude-cmd <command>    Claude command. Default: CLAUDE_CMD or claude
@@ -46,6 +50,9 @@ function parseArgs(argv) {
     thinking: "enabled",
     maxTokens: 8192,
     timeout: 600000,
+    retryAttempts: Number.parseInt(process.env.DEEPSEEK_RETRY_ATTEMPTS || "0", 10),
+    retryDelay: Number.parseInt(process.env.DEEPSEEK_RETRY_DELAY || "1000", 10),
+    retryMaxDelay: Number.parseInt(process.env.DEEPSEEK_RETRY_MAX_DELAY || "30000", 10),
     fallback: true,
     claudeCmd: process.env.CLAUDE_CMD || "claude",
     detach: false
@@ -70,6 +77,9 @@ function parseArgs(argv) {
     else if (arg === "--thinking") opts.thinking = next();
     else if (arg === "--max-tokens") opts.maxTokens = Number.parseInt(next(), 10);
     else if (arg === "--timeout") opts.timeout = Number.parseInt(next(), 10);
+    else if (arg === "--retry-attempts") opts.retryAttempts = Number.parseInt(next(), 10);
+    else if (arg === "--retry-delay") opts.retryDelay = Number.parseInt(next(), 10);
+    else if (arg === "--retry-max-delay") opts.retryMaxDelay = Number.parseInt(next(), 10);
     else if (arg === "--detach") opts.detach = true;
     else if (arg === "--no-fallback") opts.fallback = false;
     else if (arg === "--claude-cmd") opts.claudeCmd = next();
@@ -86,6 +96,9 @@ function validateOpts(opts) {
   if (promptSources > 1) throw new Error("Use only one prompt source.");
   if (!Number.isFinite(opts.maxTokens) || opts.maxTokens <= 0) throw new Error("--max-tokens must be a positive number.");
   if (!Number.isFinite(opts.timeout) || opts.timeout <= 0) throw new Error("--timeout must be a positive number.");
+  if (!Number.isInteger(opts.retryAttempts) || opts.retryAttempts < 0) throw new Error("--retry-attempts must be a non-negative integer (0 = retry forever).");
+  if (!Number.isInteger(opts.retryDelay) || opts.retryDelay < 100) throw new Error("--retry-delay must be at least 100 ms.");
+  if (!Number.isInteger(opts.retryMaxDelay) || opts.retryMaxDelay < opts.retryDelay) throw new Error("--retry-max-delay must be >= --retry-delay.");
   if (!["enabled", "disabled"].includes(opts.thinking)) throw new Error("--thinking must be enabled or disabled.");
   if (!["high", "max"].includes(opts.effort)) throw new Error("--effort must be high or max.");
 }
@@ -128,6 +141,9 @@ function detachedArgv(opts) {
   args.push("--thinking", opts.thinking);
   args.push("--max-tokens", String(opts.maxTokens));
   args.push("--timeout", String(opts.timeout));
+  args.push("--retry-attempts", String(opts.retryAttempts));
+  args.push("--retry-delay", String(opts.retryDelay));
+  args.push("--retry-max-delay", String(opts.retryMaxDelay));
   args.push("--claude-cmd", opts.claudeCmd);
   if (!opts.fallback) args.push("--no-fallback");
   return args;
@@ -149,39 +165,51 @@ async function callDeepSeek(opts, prompt) {
   const apiKey = await getDeepSeekApiKey();
   if (!apiKey) throw new Error("No DeepSeek API key found. Run: dsw config set-key <key>");
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), opts.timeout);
+  // Retry transient fetch failures (network blips, timeouts, HTTP 429/5xx)
+  // with exponential backoff instead of crashing. --retry-attempts 0 keeps
+  // retrying forever. There is no user-interrupt path here: any AbortError is
+  // the per-attempt timeout and therefore retryable.
+  for (let attempt = 1; ; attempt += 1) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), opts.timeout);
+    try {
+      const response = await fetch(`${opts.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(applyThinkingOptions({
+          model: opts.model,
+          messages: [{ role: "user", content: prompt }],
+          max_tokens: opts.maxTokens
+        }, opts))
+      });
 
-  try {
-    const response = await fetch(`${opts.baseUrl.replace(/\/$/, "")}/chat/completions`, {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        "Authorization": `Bearer ${apiKey}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(applyThinkingOptions({
-        model: opts.model,
-        messages: [{ role: "user", content: prompt }],
-        max_tokens: opts.maxTokens
-      }, opts))
-    });
+      const text = await response.text();
+      if (!response.ok) throw await deepSeekHttpError(new Response(text, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers
+      }));
 
-    const text = await response.text();
-    if (!response.ok) throw await deepSeekHttpError(new Response(text, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: response.headers
-    }));
-
-    const data = JSON.parse(text);
-    const content = data?.choices?.[0]?.message?.content;
-    if (typeof content !== "string" || content.length === 0) {
-      throw new Error("DeepSeek returned no final content.");
+      const data = JSON.parse(text);
+      const content = data?.choices?.[0]?.message?.content;
+      if (typeof content !== "string" || content.length === 0) {
+        throw new Error("DeepSeek returned no final content.");
+      }
+      return content;
+    } catch (error) {
+      const exhausted = Number(opts.retryAttempts) > 0 && attempt >= Number(opts.retryAttempts);
+      if (exhausted || !isRetryableFetchError(error)) throw error;
+      const delay = retryBackoffMs(opts.retryDelay, opts.retryMaxDelay, attempt);
+      const reason = error.status ? `HTTP ${error.status}` : (error?.name === "AbortError" ? "timed out" : "fetch failed");
+      process.stderr.write(`[dsd] ${reason}; retrying in ${Math.round(delay / 1000)}s (attempt ${attempt})\n`);
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, delay));
+    } finally {
+      clearTimeout(timer);
     }
-    return content;
-  } finally {
-    clearTimeout(timer);
   }
 }
 

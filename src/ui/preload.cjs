@@ -15,5 +15,8 @@ contextBridge.exposeInMainWorld("deepseekUi", {
     const listener = (_event, run) => handler(run);
     ipcRenderer.on("run:update", listener);
     return () => ipcRenderer.off("run:update", listener);
-  }
+  },
+  listAgents: (options) => ipcRenderer.invoke("agents:list", options),
+  sendAgentMessage: (input) => ipcRenderer.invoke("agents:send", input),
+  listAgentInbox: (agentId) => ipcRenderer.invoke("agents:inbox", agentId)
 });

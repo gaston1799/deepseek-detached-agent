@@ -15,12 +15,51 @@
 - **Web search** — search current external information from the agent loop
 - **Shell tools** — run `cmd.exe` and PowerShell with per-session permission controls
 - **Session memory** — every conversation is saved; resume any previous session
+- **Multi-agent coordination** — stable IDs, durable peer messages, task claims, handoffs, and parked wait/wake sessions
 - **Electron UI** — launch `d -ui` for a desktop chat surface with a local control API and CDP port
 - **Unlimited tool turns** — no cap on how many tool-call loops it can make
 - **Detached mode** — fire a prompt in the background and poll for the output file
 - **Claude fallback** — `dsd` falls back to `claude -p` if DeepSeek is unavailable
 - **Dependency-light CLI** — core agent tools use built-in Node APIs; Electron is used only for `d -ui`
 - **OpenAI-compatible** — point at any compatible endpoint via `--base-url`
+- **Auto context compaction** — when a session's estimated input approaches the model context window (default: trigger at 90% of 1,048,576 tokens), older messages are folded into a single structured summary while the recent tail stays verbatim; the agent keeps working without hitting `HTTP 400: maximum context length`
+
+---
+
+## Context compaction
+
+Long agent sessions grow the transcript until the API rejects the request at
+the model's context ceiling (for DeepSeek v4-class models: **1,048,576 tokens
+total = messages + completion**). `dsw` detects this *before* the request is
+sent and compacts:
+
+- **Detection** — before every model call the wrapper estimates the messages
+  budget (`limit − max_tokens`, chars/4 × 1.2 safety factor) and triggers at
+  `--compact-at` (default `0.9`) of that budget.
+- **What survives** — the system prompt, one `<context_compaction>` summary
+  message, and the recent tail verbatim (default 40 messages, capped at ~10%
+  of the window) so `tool_call_id`s stay consistent.
+- **Methods** — `--compact-method auto` (default: DeepSeek LLM summary, falls
+  back to a deterministic roll-up of goal/plan/checkpoints if the API call
+  fails), `llm`, `truncate` (no API call, free), `detached` (spawn
+  `scripts/compact-session.mjs` in a subprocess), or `off`.
+- **Audit** — every compaction is appended to `session.compactions[]` with
+  `from_tokens`/`to_tokens`/method and printed as a ⚠ status line.
+
+CLI flags: `--compact-at <pct>` (default 0.9), `--compact-method <auto|llm|truncate|detached|off>`,
+`--compact-limit <tokens>` (default 1048576), `--compact-keep-recent <n>` (default 40), `--no-compact`.
+Environment equivalents: `DEEPSEEK_COMPACT_AT`, `DEEPSEEK_COMPACT_METHOD`, `DEEPSEEK_CONTEXT_LIMIT`,
+`DEEPSEEK_COMPACT_KEEP_RECENT`.
+
+To compact an existing session file manually (or from another agent):
+
+```bash
+node scripts/compact-session.mjs .deepseek-watch/sessions/<file>.json --method truncate
+```
+
+**Coordination-level compaction** — agents get two extra tools:
+- `compact_session` — an agent compacts *its own* session on demand (`force: true` even below the auto threshold).
+- `agent_compact <agent_id>` — the coordinator (or any agent) compacts another agent: if the target is **live** it receives an inbox `compact` request it applies mechanically on its next wake/turn and replies with the result (deterministic, no LLM involvement in the mechanics); if the target is **stopped/failed** its session file is compacted directly (with a `.compact-bak`) so its next launch resumes compacted.
 
 ---
 
@@ -160,18 +199,35 @@ In terminals that support OSC-8 hyperlinks, the TUI turns exact workspace file p
 | `web_search` | Web search via Google Custom Search when configured, then Brave, then DuckDuckGo HTML/Lite |
 | `web_fetch` | Fetch a URL and return readable page text with chunk offsets |
 | `web_find` | Fetch a URL and run a JavaScript regexp over readable page text |
+| `classify_url` | Check an unfamiliar URL for known scam, tracker, wall, executable, and shortener signatures without opening it |
+| `verify_download` | Quarantine and statically inspect a permitted local file or non-flagged URL; never executes it |
+| `watch_downloads` | List recent Downloads files and identify `.crdownload` files still in progress |
+| `file_watch` | Compare workspace file snapshots and report created, modified, and deleted files |
+| `project_memory` | Durable workspace conventions/decisions in `.deepseek-watch/project-memory.json` (never secrets) |
+| `track_bypass_state` | Persist defensive research state such as suspicious domains and verified hashes |
+| `scan_download_hash` / `virus_total` | Optional VirusTotal lookup when `VT_API_KEY` is configured |
+| `whois_lookup` / `dns_lookup` / `cert_logs` | Read-only domain registration, DNS, and Certificate Transparency reconnaissance |
+| `file_analyze` | Static file inspection: SHA-256, entropy, printable strings, and basic PE heuristics |
+| `semantic_search` | Rank workspace text files by local lexical relevance to a natural-language query |
+| `plan_review` | Git status/diff summary, whitespace check, and a compact pre-handoff checklist |
+| `agent_identity` / `agent_list` | Inspect this agent and discover live peers, roles, missions, and workspaces |
+| `agent_send` / `agent_check_inbox` / `agent_wait` | Durable peer messaging plus safe parked wait/wake behavior |
+| `agent_task_create` / `agent_task_list` / `agent_claim` / `agent_handoff` | Coordinator task contracts, atomic ownership leases, and result handoffs |
 
 ### Write tools (ask, full)
 
 | Tool | Description |
 |------|-------------|
 | `write_text_file` | Create or overwrite a file |
-| `patch_files` | Atomic multi-file patch — all `old_string` values must match before any file is written |
-| `patch_text_file` | Single-file exact search-and-replace |
+| `patch_files` | Atomic multi-file patch — all `old_string` values must match before any file is written; edits to the same file apply in order; CRLF/LF normalized for matching |
+| `patch_text_file` | Single-file search-and-replace (first occurrence, or all with `replace_all`); CRLF/LF normalized for matching |
 | `run_cmd` | Run a `cmd.exe` command |
 | `run_powershell` | Run a PowerShell command |
 | `functions_shell_command` | PowerShell with optional workspace-relative `workdir` |
 | `handoff_start` | Start a bounded delegated CLI handoff with prompt, output, and log files |
+| `process_manage` | Start/stop/status/list named detached processes; records persist in `.deepseek-watch/processes.json` so a later wrapper session can stop them; each process has separate logs and optional HTTP readiness checks |
+| `diagnostics` | Run available npm `lint`, `typecheck`, and `check` scripts |
+| `run_tests` | Run the workspace npm `test` script when configured |
 
 ### Reading by line range
 
@@ -202,6 +258,57 @@ search_code { "pattern": "TODO", "glob": "**/*.ts", "context_lines": 2 }
 }
 ```
 
+Two properties worth knowing:
+
+- **Multiple edits to the same file apply in order.** Each edit's `old_string` is
+  matched against the file content *as modified by the previous edit in the same
+  call*, so a multi-hunk edit to one file works in a single call.
+- **Line endings are normalized for matching.** On Windows checkouts (CRLF files),
+  an `old_string` written with `\n` still matches. Inserted text adopts the file's
+  dominant line ending, so a patch never rewrites the whole file's EOL style.
+  `patch_text_file` shares the same matching behavior.
+
+### Terminal UI
+
+Interactive sessions render with a Claude Code-style terminal UI (pure ANSI, no
+dependencies):
+
+- streaming **markdown-lite** output: headings, bold, inline code, fenced code
+  blocks, bullets, numbered lists, task checkboxes, blockquotes, horizontal
+  rules, and terminal links for known workspace files
+- Claude Code-style **padding + word wrapping**: content is indented 2 columns
+  on each side and wraps at word boundaries (never mid-word), re-flowing live
+  as the line streams; unbreakable over-long tokens (URLs, code) hard-split
+- a live **spinner status line** (model · phase · token count · elapsed time)
+  that stays animated during thinking/tool phases and clears before output;
+  interactive sessions also set the terminal window title (`dsw · <folder>`)
+- compact **tool-call trace**: each call prints `▹ name {args}` when it starts
+  and `✓ name (duration)` / `✗ failed` when it finishes, before the result
+
+Everything degrades to plain text when stdout is not a TTY or `--no-color` is
+set. For clean terminal copies, use `--tui-quiet` (or
+`DEEPSEEK_TUI_QUIET=1`): it disables the status line and in-place line
+rewriting, so streamed text never duplicates or leaves status artifacts when
+selected/copied mid-run. `npm run test:tui` runs the renderer self-tests.
+
+### Security tooling (allowlisted targets only)Web-app security tools for testing **your own properties** (`dsw security allow
+<domain>` registers a target; anything else is refused):
+
+- `sec_http_request` — raw HTTP(S) requests (method/headers/body/redirect control)
+- `sec_fuzz_paths` — polite, rate-limited path discovery (wordlists: `small`/`common`)
+- `sec_crt_subdomains` — passive cert-transparency subdomain enum + dangling-DNS takeover candidates
+- `sec_encode` — base64/hex/url/rot13/SHA1/SHA256/MD5/JWT/XOR workbench
+- `sec_extract_iocs` — URLs/IPv4/emails/hashes/domains out of text or files
+- `sec_scan_adware` — injected adware/miner/obfuscation/hidden-iframe/popup scanner with a clean/suspicious/infected verdict
+- `sec_headers_audit` — security-header scoring (HSTS/CSP/XFO/nosniff/Referrer-Policy), CORS origin-reflection test, cookie flags, version-disclosure notes
+
+Safety model: active tools require the target host in
+`~/.deepseek-watch/security-allowlist.json` (managed via
+`dsw security allow <domain>` / `remove` / `list`). Requests are rate-limited,
+and the tools are request primitives and passive analyzers — no
+auto-exploitation or weaponization. `npm run test:security` runs the offline
+self-tests.
+
 ---
 
 ## dsw options
@@ -221,9 +328,9 @@ search_code { "pattern": "TODO", "glob": "**/*.ts", "context_lines": 2 }
   --base-url <url>                 OpenAI-compatible base URL (default: https://api.deepseek.com)
   --effort <high|max>              Reasoning effort (default: high)
   --thinking <enabled|disabled>    Thinking toggle (default: enabled)
-  --max-tokens <n>                 Max output tokens (default: 8192)
+  --max-tokens <n>                 Max output tokens (default: 16384)
   --timeout <ms>                   Per-turn timeout ms (default: 600000)
-  --max-tool-turns <n>             Cap tool-call loops (default: unlimited)
+  --max-tool-turns <n>             Cap tool-call loops (default: unlimited); when reached, request a tools-disabled final report instead of discarding the handoff
   --tool-mode <parallel|sequential>
                                    parallel = concurrent tool calls (default)
                                    sequential = run in order

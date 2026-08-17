@@ -45,6 +45,7 @@ export async function listSessions(dir = SESSION_DIR) {
         createdAt: session.createdAt || "",
         workspace: session.workspace || "",
         permission: session.config?.permission || "",
+        agentId: session.config?.agentId || "",
         firstUserPrompt: session.messages?.find((message) => message.role === "user")?.content || ""
       });
     } catch {

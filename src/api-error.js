@@ -15,5 +15,7 @@ export async function deepSeekHttpError(response) {
     if (!detail) detail = response.statusText || "Request failed";
   }
 
-  return new Error(detail);
+  const httpError = new Error(detail);
+  httpError.status = response.status;
+  return httpError;
 }

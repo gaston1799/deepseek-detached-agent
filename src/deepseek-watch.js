@@ -1,15 +1,38 @@
 #!/usr/bin/env node
 import { appendFile, mkdir, open, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { closeSync, openSync } from "node:fs";
-import { platform, release, arch, userInfo, homedir } from "node:os";
-import { dirname, extname, isAbsolute, join, resolve, relative, delimiter } from "node:path";
+import { platform, release, arch, userInfo } from "node:os";
+import { dirname, extname, isAbsolute, join, resolve, relative } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { clearLine, createInterface, cursorTo } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { deepSeekHttpError } from "./api-error.js";
+import { isRetryableFetchError, retryBackoffMs } from "./fetch-retry.js";
 import { configPath, getDeepSeekApiKey, setDeepSeekApiKey } from "./config.js";
 import { applyThinkingOptions } from "./deepseek-request.js";
 import { listSessions, newSession, newSessionPath, readSession, sessionPath, touchSession, writeSession } from "./session-memory.js";
+import { certLogs, classifyUrl, dnsLookup, fileAnalyze, trackSafetyState, verifyDownload, virusTotalLookup, watchDownloads, whoisLookup } from "./download-safety.js";
+import { runSecurityTool, securityToolSchemas } from "./security_tools.js";
+import { createMarkdownWriter, formatDuration, ToolCallTracker } from "./tui.js";
+import { renderChatHistory, historyTitle } from "./history.js";
+import { compactSession, compactSessionDetached, estimateContextTokens, estimateMessageTokens, estimateTokens } from "./context-compactor.js";
+import {
+  acknowledgeAgentMessages,
+  claimTask,
+  completeTask,
+  coordinationRoot,
+  createAgentRuntime,
+  createTask,
+  formatAgentMessages,
+  generateAgentId,
+  listAgents,
+  listTasks,
+  readAgentInbox,
+  sendAgentMessage,
+  validateAgentId,
+  waitForAgentMessages
+} from "./agent-coordination.js";
+import { discoverSkills, formatSkillList, renderLoadedSkills, resolveSkill, runSkillCommand, skillRootsWithSources, skillUsage } from "./skills.js";
 
 const DEFAULT_BASE_URL = "https://api.deepseek.com";
 const DEFAULT_MODEL = "deepseek-v4-flash";
@@ -27,6 +50,21 @@ Usage:
   dsw
   dsw -ui [options]
   dsw doctor
+  dsw agents [--all] [--json] [-i|--interactive] [--coord-dir <dir>]
+  dsw message <agent-id> <message> [--from <agent-id>] [--coord-dir <dir>]
+  dsw wake <agent-id> [message] [--from <agent-id>] [--coord-dir <dir>]
+  dsw inbox <agent-id> [--coord-dir <dir>]
+  dsw tasks [--coord-dir <dir>]
+  dsw security allow <domain>
+  dsw security remove <domain>
+  dsw security list
+  dsw skill list [--json]
+  dsw skill read <name>
+  dsw skill install <name|repo|path> [--force]
+  dsw skill create <name> [--description <text>]
+  dsw skill remove <name>
+  dsw skill sync [--from-workspace|--to-workspace] [--force] [--migrate-from-codex]
+  dsw skill doctor
   dsw config set-key <key>
   dsw config set-openai-key <key>
   dsw config set-google-search-key <key>
@@ -50,13 +88,17 @@ Options:
   --skills <a,b>               Comma-separated skills to load.
   --skill-root <dir>           Directory containing skill folders. Repeatable.
   --list-skills                List discovered local skills and exit.
+  --skill-root also selects the canonical DeepSeek root for dsw skill install/create/remove/sync.
   --model <name>               DeepSeek model. Default: deepseek-v4-flash
   --base-url <url>             OpenAI-compatible base URL. Default: https://api.deepseek.com
   --effort <high|max>          Reasoning effort. Default: high
   --thinking <enabled|disabled>
                                DeepSeek thinking toggle. Default: enabled
-  --max-tokens <number>        Max output tokens. Default: 8192
+  --max-tokens <number>        Max output tokens. Default: 16384
   --timeout <ms>               Request timeout per turn. Default: 600000
+  --retry-attempts <number>    Max retries for transient fetch failures (0 = keep retrying forever). Default: 0
+  --retry-delay <ms>           Initial retry backoff, doubles per attempt. Default: 1000
+  --retry-max-delay <ms>       Retry backoff cap. Default: 30000
   --max-tool-turns <number>    Max tool call loops. Default: unlimited
   --tool-mode <parallel|sequential>
                                parallel runs tool calls concurrently; sequential runs in order. Default: parallel
@@ -64,6 +106,11 @@ Options:
                                Session permission level. review=read-only, ask=prompt for shell, full=auto-run shell.
   --session <file>             Session memory JSON file. Default: new timestamped session.
   --resume                     Resume from --session, or pick a recent session if omitted.
+  --new                        Start a fresh session for --agent-id instead of resuming its existing one.
+  --agent-id <id>              Stable coordination identity. Default: generated and saved in the session.
+  --agent-role <role>          Agent role, such as coordinator or worker. Default: worker
+  --agent-mission <text>       Current mission shown to other agents.
+  --coord-dir <dir>            Shared coordination directory. Default: .deepseek-watch/coordination
   --no-save-session            Do not write session memory to disk.
   -o, --output <file>          Write a Markdown result file.
   --outfile <file>             Alias for --output.
@@ -73,6 +120,12 @@ Options:
                                Run requested cmd/PowerShell commands without prompting.
   --no-tools                   Disable built-in read-only workspace tools.
   --no-color                   Disable ANSI colors.
+  --tui-quiet                  Clean-copy mode: no status line, no in-place line rewriting (text streams line-by-line).
+  --compact-at <pct>           Auto-compact when estimated context hits this fraction of the limit. Default: 0.9
+  --compact-method <method>    auto|llm|truncate|detached|off. Default: auto (LLM summary, truncate fallback on error)
+  --compact-limit <tokens>     Total context window used for compaction math. Default: 1048576
+  --compact-keep-recent <n>    Messages kept verbatim after compaction. Default: 40
+  --no-compact                 Disable automatic context compaction (alias for --compact-method off).
   -h, --help                   Show help.
 `;
 }
@@ -83,8 +136,11 @@ function parseArgs(argv) {
     baseUrl: process.env.DEEPSEEK_BASE_URL || DEFAULT_BASE_URL,
     effort: "high",
     thinking: "enabled",
-    maxTokens: 8192,
+    maxTokens: 16384,
     timeout: 600000,
+    retryAttempts: Number.parseInt(process.env.DEEPSEEK_RETRY_ATTEMPTS || "0", 10),
+    retryDelay: Number.parseInt(process.env.DEEPSEEK_RETRY_DELAY || "1000", 10),
+    retryMaxDelay: Number.parseInt(process.env.DEEPSEEK_RETRY_MAX_DELAY || "30000", 10),
     maxToolTurns: null,
     toolMode: "parallel",
     permission: null,
@@ -95,12 +151,22 @@ function parseArgs(argv) {
     noOutput: false,
     fullChat: false,
     resume: false,
+    newSession: false,
     dangerouslyAutoRunCommands: false,
     tools: true,
     skills: [],
     skillRoots: [],
     listSkills: false,
-    color: process.env.NO_COLOR ? false : process.stdout.isTTY
+    color: process.env.NO_COLOR ? false : process.stdout.isTTY,
+    tuiQuiet: process.env.DEEPSEEK_TUI_QUIET === "1",
+    agentId: process.env.DEEPSEEK_AGENT_ID || null,
+    agentRole: process.env.DEEPSEEK_AGENT_ROLE || null,
+    agentMission: process.env.DEEPSEEK_AGENT_MISSION || "",
+    coordDir: process.env.DEEPSEEK_COORD_DIR || null,
+    compactAt: Number.parseFloat(process.env.DEEPSEEK_COMPACT_AT || "0.9"),
+    compactMethod: process.env.DEEPSEEK_COMPACT_METHOD || "auto",
+    contextLimit: Number.parseInt(process.env.DEEPSEEK_CONTEXT_LIMIT || "1048576", 10),
+    compactKeepRecent: Number.parseInt(process.env.DEEPSEEK_COMPACT_KEEP_RECENT || "40", 10)
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -128,6 +194,9 @@ function parseArgs(argv) {
     else if (arg === "--thinking") opts.thinking = next();
     else if (arg === "--max-tokens") opts.maxTokens = Number.parseInt(next(), 10);
     else if (arg === "--timeout") opts.timeout = Number.parseInt(next(), 10);
+    else if (arg === "--retry-attempts") opts.retryAttempts = Number.parseInt(next(), 10);
+    else if (arg === "--retry-delay") opts.retryDelay = Number.parseInt(next(), 10);
+    else if (arg === "--retry-max-delay") opts.retryMaxDelay = Number.parseInt(next(), 10);
     else if (arg === "--max-tool-turns") opts.maxToolTurns = Number.parseInt(next(), 10);
     else if (arg === "--tool-mode") opts.toolMode = next();
     else if (arg === "--permission") opts.permission = next();
@@ -136,6 +205,11 @@ function parseArgs(argv) {
       opts.explicitSession = true;
     }
     else if (arg === "--resume") opts.resume = true;
+    else if (arg === "--new") opts.newSession = true;
+    else if (arg === "--agent-id") opts.agentId = next();
+    else if (arg === "--agent-role") opts.agentRole = next();
+    else if (arg === "--agent-mission") opts.agentMission = next();
+    else if (arg === "--coord-dir") opts.coordDir = next();
     else if (arg === "--no-save-session") opts.saveSession = false;
     else if (arg === "-o" || arg === "--output" || arg === "--outfile") opts.output = next();
     else if (arg === "--no-output") opts.noOutput = true;
@@ -143,6 +217,12 @@ function parseArgs(argv) {
     else if (arg === "--dangerously-auto-run-commands") opts.dangerouslyAutoRunCommands = true;
     else if (arg === "--no-tools") opts.tools = false;
     else if (arg === "--no-color") opts.color = false;
+    else if (arg === "--tui-quiet") opts.tuiQuiet = true;
+    else if (arg === "--compact-at") opts.compactAt = Number.parseFloat(next());
+    else if (arg === "--compact-method") opts.compactMethod = next();
+    else if (arg === "--compact-limit") opts.contextLimit = Number.parseInt(next(), 10);
+    else if (arg === "--compact-keep-recent") opts.compactKeepRecent = Number.parseInt(next(), 10);
+    else if (arg === "--no-compact") opts.compactMethod = "off";
     else throw new Error(`Unknown argument: ${arg}`);
   }
 
@@ -157,10 +237,19 @@ function validateOpts(opts) {
   if (!["enabled", "disabled"].includes(opts.thinking)) throw new Error("--thinking must be enabled or disabled.");
   if (!["high", "max"].includes(opts.effort)) throw new Error("--effort must be high or max.");
   if (!["parallel", "sequential"].includes(opts.toolMode)) throw new Error("--tool-mode must be parallel or sequential.");
+  if (!Number.isInteger(opts.retryAttempts) || opts.retryAttempts < 0) throw new Error("--retry-attempts must be a non-negative integer (0 = retry forever).");
+  if (!Number.isInteger(opts.retryDelay) || opts.retryDelay < 100) throw new Error("--retry-delay must be at least 100 ms.");
+  if (!Number.isInteger(opts.retryMaxDelay) || opts.retryMaxDelay < opts.retryDelay) throw new Error("--retry-max-delay must be >= --retry-delay.");
+  if (!Number.isFinite(opts.timeout) || opts.timeout <= 0) throw new Error("--timeout must be a positive number.");
   if (opts.permission && !["review", "ask", "full"].includes(opts.permission)) throw new Error("--permission must be review, ask, or full.");
   if (opts.resume && !opts.saveSession) throw new Error("--resume cannot be combined with --no-save-session.");
+  if (opts.resume && opts.newSession) throw new Error("--resume and --new cannot be combined.");
   if (opts.noOutput && !opts.output) throw new Error("--no-output requires --output <file> or --outfile <file>.");
   if (opts.fullChat && !opts.output) throw new Error("--full-chat requires --output <file> or --outfile <file>.");
+  if (!Number.isFinite(opts.compactAt) || opts.compactAt <= 0 || opts.compactAt > 1) throw new Error("--compact-at must be a fraction in (0, 1].");
+  if (!["auto", "llm", "truncate", "detached", "off"].includes(opts.compactMethod)) throw new Error("--compact-method must be auto, llm, truncate, detached, or off.");
+  if (!Number.isInteger(opts.compactKeepRecent) || opts.compactKeepRecent < 2) throw new Error("--compact-keep-recent must be an integer >= 2.");
+  if (!Number.isFinite(opts.contextLimit) || opts.contextLimit < 2000) throw new Error("--compact-limit must be at least 2000 tokens.");
 }
 
 function readStdin() {
@@ -179,139 +268,8 @@ async function loadPrompt(opts) {
   return opts.prompt;
 }
 
-function defaultSkillRoots(opts = {}) {
-  const roots = [
-    ...(opts.skillRoots || []),
-    ...(process.env.DEEPSEEK_SKILLS_DIR ? process.env.DEEPSEEK_SKILLS_DIR.split(delimiter) : []),
-    ".deepseek-watch/skills",
-    join(homedir(), ".codex", "skills")
-  ];
-  return [...new Set(roots.filter(Boolean).map((root) => resolve(root)))];
-}
-
-function parseSkillFrontmatter(markdown, fallbackName) {
-  const text = String(markdown || "");
-  const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
-  const meta = { name: fallbackName, description: "" };
-  if (!match) return meta;
-  for (const line of match[1].split(/\r?\n/)) {
-    const pair = line.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
-    if (!pair) continue;
-    const key = pair[1];
-    const value = pair[2].trim().replace(/^["']|["']$/g, "");
-    if (key === "name" && value) meta.name = value;
-    if (key === "description" && value) meta.description = value;
-  }
-  return meta;
-}
-
-async function discoverSkills(opts = {}) {
-  const roots = defaultSkillRoots(opts);
-  const skills = [];
-  const seen = new Set();
-
-  async function addSkill(root, folder, skillFile) {
-    let text;
-    try {
-      text = await readFile(skillFile, "utf8");
-    } catch {
-      return;
-    }
-    const meta = parseSkillFrontmatter(text, folder);
-    const key = `${meta.name}\0${skillFile}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    skills.push({
-      name: meta.name,
-      folder,
-      description: meta.description,
-      root,
-      path: skillFile
-    });
-  }
-
-  async function scanRoot(root, includeHiddenGroups = true) {
-    let entries;
-    try {
-      entries = await readdir(root, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      if (entry.name.startsWith(".")) {
-        if (includeHiddenGroups) await scanRoot(join(root, entry.name), false);
-        continue;
-      }
-
-      const skillFile = join(root, entry.name, "SKILL.md");
-      await addSkill(root, entry.name, skillFile);
-    }
-  }
-
-  for (const root of roots) {
-    await scanRoot(root);
-  }
-
-  return skills.sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
-}
-
-async function resolveSkill(opts, spec) {
-  const raw = String(spec || "").trim();
-  if (!raw) throw new Error("skill name or path must be non-empty.");
-
-  const direct = resolve(raw);
-  const candidates = [
-    direct,
-    join(direct, "SKILL.md")
-  ];
-  for (const candidate of candidates) {
-    try {
-      const info = await stat(candidate);
-      if (info.isFile()) {
-        const text = await readFile(candidate, "utf8");
-        const meta = parseSkillFrontmatter(text, raw);
-        return { ...meta, path: candidate, content: text };
-      }
-    } catch {}
-  }
-
-  const skills = await discoverSkills(opts);
-  const found = skills.find((skill) => skill.name === raw || skill.folder === raw);
-  if (!found) throw new Error(`Skill not found: ${raw}. Use --list-skills or list_skills.`);
-  const content = await readFile(found.path, "utf8");
-  return { name: found.name, description: found.description, path: found.path, content };
-}
-
-async function renderLoadedSkills(opts) {
-  if (!opts.skills?.length) return "";
-  const loaded = [];
-  for (const spec of opts.skills) {
-    const skill = await resolveSkill(opts, spec);
-    loaded.push([
-      `## Skill: ${skill.name}`,
-      `Path: ${skill.path}`,
-      "",
-      skill.content.trim()
-    ].join("\n"));
-  }
-  return [
-    "",
-    "---",
-    "",
-    "Loaded local skills:",
-    "",
-    ...loaded
-  ].join("\n");
-}
-
-function formatSkillList(skills) {
-  if (!skills.length) return "No skills found.";
-  return skills.map((skill) => {
-    const desc = skill.description ? ` - ${skill.description}` : "";
-    return `${skill.name}${desc}\n  ${skill.path}`;
-  }).join("\n");
-}
+// Skills discovery, storage, and the `dsw skill` command group live in
+// ./skills.js (import-safe so the self-tests can unit-test them directly).
 
 function normalizeList(values) {
   return [...new Set((values || []).map((value) => String(value || "").trim()).filter(Boolean))];
@@ -359,8 +317,25 @@ function runtimeContext() {
   ].join("\n");
 }
 
+function agentIdentityContext(opts) {
+  if (!opts.agentId) return "";
+  return [
+    "",
+    "---",
+    "",
+    "## Agent coordination identity",
+    "",
+    `You are agent ${opts.agentId}. Keep this identity for the entire session and include it when communicating with other agents.`,
+    `agent_id: ${opts.agentId}`,
+    `agent_role: ${opts.agentRole || "worker"}`,
+    `agent_mission: ${opts.agentMission || "(not assigned)"}`,
+    `coordination_directory: ${opts.coordDir || "(not initialized)"}`,
+    "Use agent_list to discover peers and their missions, agent_send to communicate, agent_task_list/agent_claim for bounded work, agent_handoff for results, and agent_wait only when you are ready to park until a message arrives. Treat scopes claimed by other agents as read-only unless they explicitly hand them off."
+  ].join("\n");
+}
+
 async function loadSystemPrompt(opts) {
-  if (opts.system) return `${opts.system.replace("{{context}}", runtimeContext())}${await renderLoadedSkills(opts)}`;
+  if (opts.system) return `${opts.system.replace("{{context}}", runtimeContext())}${agentIdentityContext(opts)}${await renderLoadedSkills(opts)}`;
   let template;
   if (opts.systemFile) {
     template = await readFile(resolve(opts.systemFile), "utf8");
@@ -369,7 +344,7 @@ async function loadSystemPrompt(opts) {
   } else {
     template = await readFile(DEFAULT_SYSTEM_PROMPT_FILE, "utf8");
   }
-  return `${template.replace("{{context}}", runtimeContext())}${await renderLoadedSkills(opts)}`;
+  return `${template.replace("{{context}}", runtimeContext())}${agentIdentityContext(opts)}${await renderLoadedSkills(opts)}`;
 }
 
 function color(opts, code, text) {
@@ -411,6 +386,11 @@ function bold(opts, text) {
 
 function supportsTerminalLinks(opts) {
   return !opts.noOutput && process.stdout.isTTY && process.env.DEEPSEEK_NO_FILE_LINKS !== "1";
+}
+
+function setTerminalTitle(title) {
+  if (!process.stdout.isTTY) return;
+  process.stdout.write(`\x1b]0;${String(title).replace(/[\x07\x1b]/g, "")}\x07`);
 }
 
 function terminalLink(opts, text, target) {
@@ -460,10 +440,6 @@ function applyKnownFileLinks(opts, text, paths) {
   return linked;
 }
 
-function estimateTokens(text) {
-  return Math.max(0, Math.ceil(String(text || "").length / 4));
-}
-
 function formatCompactCount(value) {
   const count = Math.max(0, Math.round(Number(value) || 0));
   if (count < 1000) return String(count);
@@ -478,28 +454,6 @@ function formatCompactCount(value) {
   return String(count);
 }
 
-function estimateMessageTokens(message) {
-  if (!message || typeof message !== "object") return 0;
-  let total = estimateTokens(message.role || "") + 4;
-  total += estimateTokens(message.content || "");
-  total += estimateTokens(message.reasoning_content || "");
-  if (message.name) total += estimateTokens(message.name);
-  if (message.tool_call_id) total += estimateTokens(message.tool_call_id);
-  if (Array.isArray(message.tool_calls)) {
-    for (const call of message.tool_calls) {
-      total += estimateTokens(call.id || "");
-      total += estimateTokens(call.type || "");
-      total += estimateTokens(call.function?.name || "");
-      total += estimateTokens(call.function?.arguments || "");
-    }
-  }
-  return total;
-}
-
-function estimateContextTokens(messages) {
-  return (messages || []).reduce((sum, message) => sum + estimateMessageTokens(message), 0);
-}
-
 const STREAM_STATUS_PHRASES = [
   "Generating",
   "Thinking",
@@ -512,13 +466,17 @@ function randomStatusPhrase(phrases = STREAM_STATUS_PHRASES) {
   return phrases[Math.floor(Math.random() * phrases.length)] || "Working";
 }
 
+let activeStatusLine = null;
+
 function createStatusLine(opts, phrase = "Working", initialTokens = 0) {
-  if (opts.noOutput || !process.stdout.isTTY) {
+  if (opts.noOutput || opts.tuiQuiet || !process.stdout.isTTY) {
     return {
       isActive() { return false; },
       addTokens() {},
       setTokens() {},
       setPhrase() {},
+      setBlocked() {},
+      refresh() {},
       clear() {},
       stop() {}
     };
@@ -528,35 +486,64 @@ function createStatusLine(opts, phrase = "Working", initialTokens = 0) {
   let currentPhrase = phrase;
   let active = true;
   let visible = false;
+  let blocked = false;
+  let frame = 0;
+  let lastRenderAt = 0;
   const started = Date.now();
 
+  const modelLabel = String(opts?.model || "").split("/").pop() || "";
+  const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
   const render = () => {
-    if (!active) return;
-    const dots = ".".repeat((Math.floor((Date.now() - started) / 750) % 3) + 1);
+    if (!active || blocked) return;
+    const now = Date.now();
+    // Throttle: redraw at most every 250ms so terminal selection/copy is not
+    // flooded with near-identical status lines.
+    if (now - lastRenderAt < 250) return;
+    lastRenderAt = now;
+    const spinner = SPINNER[frame % SPINNER.length];
+    frame += 1;
+    const elapsed = formatDuration(Date.now() - started);
+    const parts = [spinner, currentPhrase, `${tokens} tokens`, elapsed];
+    if (modelLabel) parts.splice(1, 0, modelLabel);
+    let text = `  ${parts.join(" · ")}`;
+    const columns = Math.max(process.stdout.columns || 120, 1);
+    if ([...text].length > columns - 1) text = `${[...text].slice(0, columns - 2).join("")}…`;
     clearLine(process.stdout, 0);
     cursorTo(process.stdout, 0);
-    process.stdout.write(dim(opts, `  ${currentPhrase}${dots} (${tokens} tokens)`));
+    process.stdout.write(dim(opts, text));
     visible = true;
   };
 
-  const timer = setInterval(render, 750);
+  // Animated spinner: redraws are throttled and skipped while content streams
+  // (blocked), so the ⠋ keeps spinning during thinking/tool phases without
+  // flooding terminal copies with status lines.
   render();
+  const timer = setInterval(render, 120);
 
-  return {
+  const status = {
     isActive() {
       return active;
     },
     addTokens(value) {
+      // Update the counter silently; the visible redraw happens at line
+      // completions (finalize) and phase changes, so copies don't fill up
+      // with per-token status lines.
       tokens += estimateTokens(value);
-      render();
     },
     setTokens(value) {
       tokens = Math.max(0, Math.ceil(Number(value) || 0));
-      render();
+      if (!blocked) render();
     },
     setPhrase(value) {
       currentPhrase = value || currentPhrase;
-      render();
+      if (!blocked) render();
+    },
+    setBlocked(value) {
+      blocked = Boolean(value);
+      if (!blocked && active) render();
+    },
+    refresh() {
+      if (active) render();
     },
     clear() {
       if (!visible) return;
@@ -567,9 +554,12 @@ function createStatusLine(opts, phrase = "Working", initialTokens = 0) {
     stop() {
       active = false;
       clearInterval(timer);
+      if (activeStatusLine === status) activeStatusLine = null;
       this.clear();
     }
   };
+  activeStatusLine = status;
+  return status;
 }
 
 function toolStatusPhrase(name) {
@@ -724,6 +714,7 @@ function heading(opts, text, kind = "info") {
   const prefix = `${icon} ${text} `;
   const fill = Math.max(0, 72 - prefix.length);
   process.stdout.write(`\n${color(opts, code, prefix)}${dim(opts, "─".repeat(fill))}\n`);
+  if (activeStatusLine) activeStatusLine.refresh();
 }
 
 function writeSessionNotice(opts, path) {
@@ -1362,57 +1353,12 @@ function compactText(value, max = 900) {
   return `${text.slice(0, max).trimEnd()}\n...`;
 }
 
-function historyTitle(message) {
-  if (message.role === "user") return "you";
-  if (message.role === "assistant") return "assistant";
-  if (message.role === "tool") return "tool";
-  return message.role || "message";
-}
-
-function historyBody(message) {
-  if (message.role === "tool") {
-    return compactText(message.content, 500);
-  }
-
-  if (message.tool_calls?.length) {
-    const calls = message.tool_calls
-      .map((call) => call.function?.name || "tool")
-      .join(", ");
-    const content = compactText(message.content, 500);
-    return content ? `${content}\n[tool calls: ${calls}]` : `[tool calls: ${calls}]`;
-  }
-
-  return compactText(message.content, message.role === "assistant" ? 900 : 700);
-}
-
-function renderChatHistory(opts, session, maxMessages = 18) {
-  const messages = (session.messages || [])
-    .filter((message) => message.role !== "system")
-    .slice(-maxMessages);
-
-  process.stdout.write("\x1b[2J\x1b[H");
-  process.stdout.write(`  ${bold(opts, "Session history")}\n`);
-  process.stdout.write(`  ${dim(opts, `permission ${session.config?.permission || "ask"}  -  ${messages.length} shown`)}\n\n`);
-
-  if (messages.length === 0) {
-    process.stdout.write(`  ${dim(opts, "No previous messages.")}\n\n`);
-    return;
-  }
-
-  for (const message of messages) {
-    const title = historyTitle(message);
-    const body = historyBody(message);
-    const colorCode = message.role === "user" ? "1;36" : message.role === "assistant" ? "1;32" : "1;33";
-    process.stdout.write(`  ${color(opts, colorCode, title)}\n`);
-    process.stdout.write(`${dim(opts, body.split("\n").map((line) => `    ${line}`).join("\n"))}\n\n`);
-  }
-}
-
 function sessionLabel(item, index) {
   const prompt = item.firstUserPrompt.replace(/\s+/g, " ").slice(0, 70);
   const when = item.updatedAt || item.createdAt || "unknown";
   const permission = item.permission ? `[${item.permission}]` : "";
-  return `${String(index + 1).padStart(2, " ")}  ${when} ${permission}  ${prompt || "(no prompt)"}`;
+  const agent = item.agentId ? ` ${item.agentId}` : "";
+  return `${String(index + 1).padStart(2, " ")}  ${when}${agent} ${permission}  ${prompt || "(no prompt)"}`;
 }
 
 async function pickMenu(opts, title, hint, items) {
@@ -1436,6 +1382,7 @@ async function pickDashboardAction(opts) {
   return pickMenu(opts, "DeepSeek Watch", "Enter a number and press Enter. q to quit.", [
     { id: "new", label: "New run" },
     { id: "resume", label: "Resume session" },
+    { id: "agents", label: "Agents - send messages, wake parked" },
     { id: "config", label: "Show config path" },
     { id: "help", label: "Show help" },
     { id: "quit", label: "Quit" }
@@ -1476,33 +1423,42 @@ async function dashboardOpts() {
     return opts;
   }
 
-  const action = await pickDashboardAction(opts);
-  if (action === "quit") {
-    opts.quit = true;
-    return opts;
-  }
-  if (action === "help") {
-    opts.help = true;
-    return opts;
-  }
-  if (action === "config") {
-    process.stdout.write(`${configPath()}\n`);
-    opts.quit = true;
-    return opts;
-  }
-
-  if (action === "resume") {
-    opts.resume = true;
-    opts.session = await pickSession(opts);
-    const session = await readSession(opts.session);
-    renderChatHistory(opts, session);
-  } else {
-    const permission = await pickPermission(opts);
-    if (permission === "quit") {
+  for (;;) {
+    const action = await pickDashboardAction(opts);
+    if (action === "quit") {
       opts.quit = true;
       return opts;
     }
-    opts.permission = permission;
+    if (action === "help") {
+      opts.help = true;
+      return opts;
+    }
+    if (action === "config") {
+      process.stdout.write(`${configPath()}\n`);
+      opts.quit = true;
+      return opts;
+    }
+    if (action === "agents") {
+      await runCoordinationCommand("agents", ["--interactive"]);
+      continue; // return to the dashboard menu after the panel exits
+    }
+
+    if (action === "resume") {
+      opts.resume = true;
+      const picked = await pickSession(opts);
+      opts.session = picked.path;
+      if (picked.agentId && !opts.agentId) opts.agentId = picked.agentId;
+      const session = await readSession(opts.session);
+      renderChatHistory(opts, session);
+    } else {
+      const permission = await pickPermission(opts);
+      if (permission === "quit") {
+        opts.quit = true;
+        return opts;
+      }
+      opts.permission = permission;
+    }
+    break;
   }
   opts.interactiveChat = true;
   const prompt = await promptLine("Prompt> ");
@@ -1514,24 +1470,60 @@ async function dashboardOpts() {
   return opts;
 }
 
-async function pickSession(opts) {
-  const items = await listSessions();
-  if (items.length === 0) throw new Error("No saved sessions found.");
-  if (!process.stdin.isTTY) return items[0].path;
+// Coordination agent records (all states) for resume/spawn decisions.
+async function coordinationAgentRecords(opts) {
+  const root = coordinationRoot(opts.coordDir);
+  try {
+    await stat(join(root, "agents"));
+  } catch {
+    return [];
+  }
+  return listAgents(root, { includeStopped: true });
+}
 
-  process.stdout.write(`\n  ${bold(opts, "Sessions")}\n\n`);
-  items.forEach((item, i) => {
-    process.stdout.write(`  ${sessionLabel(item, i)}\n`);
+async function pickSession(opts) {
+  const agents = await coordinationAgentRecords(opts);
+  const items = await listSessions();
+  const entries = [
+    ...agents.filter((agent) => agent.session).map((agent) => ({
+      label: `${agent.agentId}  [${agent.state}${agent.live ? " LIVE" : ""}]  ${String(agent.session).split(/[\\/]/).pop()}`,
+      path: agent.session,
+      agentId: agent.agentId
+    })),
+    ...items.map((item) => ({
+      label: `${item.agentId ? `${item.agentId} · ` : ""}${sessionLabel(item, 0).replace(/^\s*\d+\s+/, "")}`,
+      path: item.path,
+      agentId: item.agentId || null
+    }))
+  ].filter((entry) => entry.path);
+
+  if (entries.length === 0) throw new Error("No saved sessions or coordination agents found.");
+  if (!process.stdin.isTTY) {
+    return { path: items.length ? items[0].path : entries[0].path, agentId: items.length ? (items[0].agentId || null) : entries[0].agentId };
+  }
+
+  process.stdout.write(`\n  ${bold(opts, "Resume")}\n\n`);
+  entries.forEach((entry, i) => {
+    process.stdout.write(`  ${String(i + 1).padStart(2, " ")}  ${entry.label}\n`);
   });
   process.stdout.write("\n");
   while (true) {
-    const answer = await promptLine(`  Choose session (1-${items.length}, q to cancel): `);
+    const answer = await promptLine(`  Choose 1-${entries.length}, q to cancel: `);
     const trimmed = answer.trim().toLowerCase();
-    if (trimmed === "q" || trimmed === "") throw new Error("Session selection cancelled.");
+    if (trimmed === "q" || trimmed === "") throw new Error("Resume selection cancelled.");
     const n = parseInt(trimmed, 10);
-    if (n >= 1 && n <= items.length) return items[n - 1].path;
-    process.stdout.write(`  Invalid. Enter 1-${items.length} or q.\n`);
+    if (n >= 1 && n <= entries.length) return { path: entries[n - 1].path, agentId: entries[n - 1].agentId };
+    process.stdout.write(`  Invalid. Enter 1-${entries.length} or q.\n`);
   }
+}
+
+// Sessions persist config.agentId, so a stable agent id can be tied to a
+// single session file: find the agent's most recently updated session.
+async function findSessionForAgent(agentId) {
+  if (!agentId) return null;
+  const sessions = await listSessions();
+  const match = sessions.find((entry) => entry.agentId === agentId);
+  return match ? match.path : null;
 }
 
 function toolSchemas(opts) {
@@ -1627,7 +1619,7 @@ function toolSchemas(opts) {
       type: "function",
       function: {
         name: "list_skills",
-        description: "List local skills discovered from --skill-root, DEEPSEEK_SKILLS_DIR, .deepseek-watch/skills, and ~/.codex/skills. Read-only.",
+        description: "List local skills discovered from --skill-root, DEEPSEEK_SKILLS_DIR, ~/.deepseek/skills, ~/.codex/skills (fallback), and .deepseek-watch/skills, in precedence order. Read-only.",
         parameters: { type: "object", properties: {}, additionalProperties: false }
       }
     },
@@ -2091,7 +2083,9 @@ function toolSchemas(opts) {
     }
   );
 
-  if (opts.permission === "review") return schemas;
+  const reviewSchemaCount = schemas.length;
+
+  schemas.push(...securityToolSchemas());
 
   schemas.push(
     {
@@ -2114,7 +2108,7 @@ function toolSchemas(opts) {
       type: "function",
       function: {
         name: "patch_files",
-        description: "Apply multiple old_string→new_string replacements across one or more files atomically. All old_strings must match before any file is written. User is prompted unless full/auto-run mode.",
+        description: "Apply multiple old_string→new_string replacements across one or more files atomically. All old_strings must match before any file is written. Edits to the same file apply in order. CRLF/LF line endings are normalized for matching; inserted text uses the file's dominant line ending. User is prompted unless full/auto-run mode.",
         parameters: {
           type: "object",
           properties: {
@@ -2143,7 +2137,7 @@ function toolSchemas(opts) {
       type: "function",
       function: {
         name: "patch_text_file",
-        description: "Replace the first occurrence of old_string with new_string in a workspace file. Fails if old_string is not found. User is prompted unless full/auto-run mode.",
+        description: "Replace the first occurrence of old_string with new_string in a workspace file. Fails if old_string is not found. CRLF/LF line endings are normalized for matching; inserted text uses the file's dominant line ending. User is prompted unless full/auto-run mode.",
         parameters: {
           type: "object",
           properties: {
@@ -2166,6 +2160,7 @@ function toolSchemas(opts) {
           type: "object",
           properties: {
             command: { type: "string", description: "Command text to pass to cmd.exe /d /s /c." },
+            path: { type: "string", description: "Working directory for the command. Absolute paths are used as-is; relative paths resolve against the workspace root. Defaults to the workspace root." },
             timeout_ms: { type: "number", description: "Timeout in milliseconds. Defaults to 60000." }
           },
           required: ["command"],
@@ -2182,6 +2177,7 @@ function toolSchemas(opts) {
           type: "object",
           properties: {
             command: { type: "string", description: "PowerShell command text." },
+            path: { type: "string", description: "Working directory for the command. Absolute paths are used as-is; relative paths resolve against the workspace root. Defaults to the workspace root." },
             timeout_ms: { type: "number", description: "Timeout in milliseconds. Defaults to 60000." }
           },
           required: ["command"],
@@ -2193,12 +2189,12 @@ function toolSchemas(opts) {
       type: "function",
       function: {
         name: "functions_shell_command",
-        description: "Execute a shell command in the workspace using PowerShell on Windows. Supports an optional workspace-relative working directory. Blocked in review permission mode. User is prompted unless full/auto-run mode.",
+        description: "Execute a shell command in the workspace using PowerShell on Windows. Supports an optional working directory (absolute, or relative to the workspace root). Blocked in review permission mode. User is prompted unless full/auto-run mode.",
         parameters: {
           type: "object",
           properties: {
             command:    { type: "string", description: "Command to run." },
-            workdir:    { type: "string", description: "Workspace-relative working directory. Defaults to workspace root." },
+            workdir:    { type: "string", description: "Working directory for the command: absolute path used as-is, or relative to the workspace root. Defaults to the workspace root." },
             timeout_ms: { type: "number", description: "Timeout in milliseconds. Defaults to 120000." }
           },
           required: ["command"],
@@ -2228,6 +2224,391 @@ function toolSchemas(opts) {
     }
   );
 
+  schemas.push(
+    {
+      type: "function",
+      function: {
+        name: "classify_url",
+        description: "Classify an HTTP(S) URL using known deceptive-download, tracker, wall, executable, and shortener signatures. Read-only; does not open the URL.",
+        parameters: { type: "object", properties: { url: { type: "string", description: "URL to classify." } }, required: ["url"], additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "verify_download",
+        description: "Copy a local workspace/Downloads file or download a non-flagged HTTP(S) URL to quarantine, then calculate SHA-256 and static file-risk indicators. Never executes the file.",
+        parameters: { type: "object", properties: { input: { type: "string", description: "HTTP(S) URL or local file path under the workspace or Downloads." }, quarantine_dir: { type: "string", description: "Optional quarantine directory." } }, required: ["input"], additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "watch_downloads",
+        description: "List recent Downloads files and mark .crdownload files as in-progress. Read-only.",
+        parameters: { type: "object", properties: { since: { type: "string", description: "Optional ISO timestamp cutoff." } }, additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "track_bypass_state",
+        description: "Persist safety research state such as suspicious domains, wall notes, and verified download hashes across sessions. This does not bypass access controls.",
+        parameters: { type: "object", properties: { key: { type: "string" }, value: { description: "Optional JSON-compatible value to store." } }, required: ["key"], additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "scan_download_hash",
+        description: "Look up a SHA-256 hash in VirusTotal when VT_API_KEY is configured. Read-only.",
+        parameters: { type: "object", properties: { hash: { type: "string" } }, required: ["hash"], additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "virus_total",
+        description: "Look up a SHA-256 hash or URL in VirusTotal when VT_API_KEY is configured. Read-only.",
+        parameters: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "whois_lookup",
+        description: "Look up public domain-registration metadata through RDAP. Read-only.",
+        parameters: { type: "object", properties: { domain: { type: "string" } }, required: ["domain"], additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "dns_lookup",
+        description: "Resolve A, AAAA, and MX records for a domain. Read-only.",
+        parameters: { type: "object", properties: { domain: { type: "string" } }, required: ["domain"], additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "cert_logs",
+        description: "Search public Certificate Transparency logs for a domain via crt.sh. Read-only.",
+        parameters: { type: "object", properties: { domain: { type: "string" } }, required: ["domain"], additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "file_analyze",
+        description: "Perform static PE/file inspection: SHA-256, entropy, strings, and packer heuristics. Never executes the file.",
+        parameters: { type: "object", properties: { path: { type: "string", description: "Workspace-relative file path." } }, required: ["path"], additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "process_manage",
+        description: "Start, stop, list, or inspect named detached local processes. Started processes write stdout/stderr to .deepseek-watch/processes and can wait for an HTTP readiness URL. Start/stop require command permission.",
+        parameters: {
+          type: "object",
+          properties: {
+            action: { type: "string", enum: ["start", "stop", "status", "list"], description: "Process operation." },
+            name: { type: "string", description: "Required except for action=list; stable local process name." },
+            command: { type: "string", description: "Required for action=start; command passed to the selected shell." },
+            shell: { type: "string", enum: ["powershell", "cmd"], description: "Shell for start. Defaults to powershell." },
+            workdir: { type: "string", description: "Optional workspace-relative working directory." },
+            ready_url: { type: "string", description: "Optional HTTP(S) endpoint that must respond successfully before start returns." },
+            ready_timeout_ms: { type: "number", description: "Readiness deadline, 1000-300000ms. Defaults to 30000." }
+          },
+          required: ["action"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "file_watch",
+        description: "Record and compare a workspace file or directory snapshot. First call initializes the watch; later calls return created, modified, and deleted files since the last call. Read-only.",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Workspace-relative file or directory path." },
+            recursive: { type: "boolean", description: "Recurse into subdirectories. Defaults to true." },
+            reset: { type: "boolean", description: "Discard the prior snapshot and initialize a new one." },
+            max_changes: { type: "number", description: "Maximum changes to return. Defaults to 200, max 2000." }
+          },
+          required: ["path"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "project_memory",
+        description: "Read or maintain workspace memory in .deepseek-watch/project-memory.json. Store durable project conventions and decisions, never credentials. Set/delete require write permission.",
+        parameters: {
+          type: "object",
+          properties: {
+            action: { type: "string", enum: ["get", "set", "delete", "list"], description: "Memory operation." },
+            key: { type: "string", description: "Memory key; required except for list." },
+            value: { description: "JSON-compatible value for action=set." }
+          },
+          required: ["action"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "diagnostics",
+        description: "Run configured workspace lint/type-check scripts safely through npm. Uses lint, typecheck, and check when present. Requires command permission.",
+        parameters: {
+          type: "object",
+          properties: { timeout_ms: { type: "number", description: "Per-script deadline. Defaults to 120000, max 600000." } },
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "run_tests",
+        description: "Run the workspace npm test script if configured. Requires command permission.",
+        parameters: {
+          type: "object",
+          properties: { timeout_ms: { type: "number", description: "Test deadline. Defaults to 120000, max 600000." } },
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "semantic_search",
+        description: "Rank workspace text files by relevance to several search terms. This is local lexical relevance ranking, not an embeddings service. Read-only.",
+        parameters: {
+          type: "object",
+          properties: {
+            query: { type: "string", description: "Natural-language phrase or technical terms to locate." },
+            max_results: { type: "number", description: "Maximum ranked files. Defaults to 20, max 100." }
+          },
+          required: ["query"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "plan_review",
+        description: "Run a compact pre-handoff review: git status, diff stat, whitespace validation, and a behavior/verification checklist. Read-only.",
+        parameters: { type: "object", properties: {}, additionalProperties: false }
+      }
+    }
+  );
+  schemas.push(
+    {
+      type: "function",
+      function: {
+        name: "agent_identity",
+        description: "Return this agent's stable ID, role, mission, state, session, workspace, and coordination directory.",
+        parameters: { type: "object", properties: {}, additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "agent_list",
+        description: "Discover agents registered in the shared coordination directory and inspect their current missions and states.",
+        parameters: {
+          type: "object",
+          properties: { include_stopped: { type: "boolean", description: "Include completed, failed, stopped, and stale agents. Default false." } },
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "agent_send",
+        description: "Send a durable message to another agent. A parked recipient wakes; a working recipient receives it at a safe turn boundary.",
+        parameters: {
+          type: "object",
+          properties: {
+            to: { type: "string", description: "Recipient agent ID." },
+            message: { type: "string", description: "Message body." },
+            type: { type: "string", enum: ["message", "task", "status_request", "status", "handoff", "wake"], description: "Message type. Default message." },
+            priority: { type: "string", enum: ["low", "normal", "high"], description: "Message priority. Default normal." },
+            task_id: { type: "string", description: "Optional related task ID." },
+            reply_to: { type: "string", description: "Optional message ID being answered." }
+          },
+          required: ["to", "message"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "agent_check_inbox",
+        description: "Peek at pending agent messages without consuming them. Messages are consumed automatically when injected into a turn.",
+        parameters: { type: "object", properties: { max: { type: "number", description: "Maximum messages. Default 100." } }, additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "agent_task_create",
+        description: "Create a bounded shared task. Reserved for an agent launched with --agent-role coordinator.",
+        parameters: {
+          type: "object",
+          properties: {
+            task_id: { type: "string" },
+            title: { type: "string" },
+            description: { type: "string" },
+            scope: { type: "array", items: { type: "string" }, description: "Paths/components exclusively owned by the task." },
+            acceptance_criteria: { type: "array", items: { type: "string" } },
+            depends_on: { type: "array", items: { type: "string" } }
+          },
+          required: ["task_id", "title"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "agent_task_list",
+        description: "List shared tasks, ownership claims, scopes, dependencies, and status.",
+        parameters: { type: "object", properties: {}, additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "agent_claim",
+        description: "Atomically claim a shared task lease so another agent cannot claim the same work.",
+        parameters: {
+          type: "object",
+          properties: {
+            task_id: { type: "string" },
+            lease_seconds: { type: "number", description: "Lease duration. Default 1800; range 30-86400." }
+          },
+          required: ["task_id"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "agent_handoff",
+        description: "Mark a claimed task ready for review and optionally message another agent with the result.",
+        parameters: {
+          type: "object",
+          properties: {
+            task_id: { type: "string" },
+            summary: { type: "string" },
+            to: { type: "string", description: "Optional recipient, usually the coordinator." },
+            status: { type: "string", enum: ["ready_for_review", "blocked", "complete"] }
+          },
+          required: ["task_id", "summary"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "compact_session",
+        description: "Compact THIS agent's own session transcript now: fold the old message prefix into one summary (LLM via the session's compact method, or deterministic), keep the recent tail verbatim. Returns before/after token estimates. Use when context is large or when the coordinator reports your session near the limit.",
+        parameters: {
+          type: "object",
+          properties: {
+            force: { type: "boolean", description: "Compact even below the auto threshold. Default false." }
+          },
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "agent_compact",
+        description: "Compact another agent's session transcript (coordination-level). If the target is live (running or parked), sends it an inbox compact request it applies on its next wake/turn and replies with the result. If the target is stopped/failed, compacts its session file directly so its next launch resumes compacted.",
+        parameters: {
+          type: "object",
+          properties: {
+            agent_id: { type: "string" },
+            method: { type: "string", enum: ["auto", "truncate"], description: "truncate = free deterministic roll-up (default for stopped targets); auto = LLM summary with truncate fallback." }
+          },
+          required: ["agent_id"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "spawn_agent",
+        description: "COORDINATOR-ONLY. Spawn a NEW agent as a detached background process (non-blocking; this agent keeps working). Pulls the current working directory and the shared --coord-dir. FAILS if agent_id already exists — use resume_agent to resume an existing id instead.",
+        parameters: {
+          type: "object",
+          properties: {
+            agent_id: { type: "string", description: "New stable id. Must NOT already exist in coordination." },
+            role: { type: "string", enum: ["coordinator", "worker"], description: "Default worker." },
+            mission: { type: "string" },
+            prompt: { type: "string", description: "Initial prompt for the new agent." },
+            model: { type: "string", description: "Model override (default deepseek-v4-flash)." },
+            permission: { type: "string", enum: ["review", "ask", "full"], description: "Default full." }
+          },
+          required: ["agent_id", "prompt"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "resume_agent",
+        description: "COORDINATOR-ONLY. Spawn an EXISTING agent id as a detached background process, resuming that agent's saved session (state, mission, claims). FAILS if the id has no coordination record (use spawn_agent) or is currently live (PID).",
+        parameters: {
+          type: "object",
+          properties: {
+            agent_id: { type: "string" },
+            prompt: { type: "string", description: "Prompt appended to the resumed session." },
+            mission: { type: "string", description: "Optional mission override for this launch." },
+            model: { type: "string" },
+            permission: { type: "string", enum: ["review", "ask", "full"] }
+          },
+          required: ["agent_id", "prompt"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "agent_wait",
+        description: "Park this wrapper after the current tool batch until another agent sends a message. No model request remains active while parked.",
+        parameters: {
+          type: "object",
+          properties: {
+            reason: { type: "string", description: "Why the agent is waiting." },
+            timeout_seconds: { type: "number", description: "Optional timeout. Omit or use 0 to wait indefinitely." }
+          },
+          additionalProperties: false
+        }
+      }
+    }
+  );
+  if (opts.permission === "review") {
+    return schemas.filter((schema, index) => index < reviewSchemaCount || schema.function?.name?.startsWith("agent_"));
+  }
   return schemas;
 }
 
@@ -2345,9 +2726,24 @@ function runLocalCommand(exe, args, timeoutMs, cwd = process.cwd()) {
     let stdout = "";
     let stderr = "";
     let timedOut = false;
-    const timer = setTimeout(() => {
+    let settled = false;
+    let timer;
+    const finish = (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const parts = [`exit_code=${code ?? "unknown"}`];
+      if (timedOut) parts.push("timed_out=true");
+      if (stdout.trim()) parts.push(`stdout:\n${stdout.trimEnd()}`);
+      if (stderr.trim()) parts.push(`stderr:\n${stderr.trimEnd()}`);
+      resolvePromise(parts.join("\n"));
+    };
+    timer = setTimeout(() => {
       timedOut = true;
-      child.kill();
+      // A background process launched by the shell can inherit stdout/stderr.
+      // Do not wait for those streams to close: report the timeout immediately.
+      try { child.kill(); } catch {}
+      finish(null);
     }, timeoutMs);
 
     child.stdout.setEncoding("utf8");
@@ -2355,18 +2751,329 @@ function runLocalCommand(exe, args, timeoutMs, cwd = process.cwd()) {
     child.stdout.on("data", (chunk) => { stdout += chunk; });
     child.stderr.on("data", (chunk) => { stderr += chunk; });
     child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       resolvePromise(`command error: ${error.message}`);
     });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      const parts = [`exit_code=${code}`];
-      if (timedOut) parts.push("timed_out=true");
-      if (stdout.trim()) parts.push(`stdout:\n${stdout.trimEnd()}`);
-      if (stderr.trim()) parts.push(`stderr:\n${stderr.trimEnd()}`);
-      resolvePromise(parts.join("\n"));
-    });
+    // `close` waits for stdio to close. On Windows, Start-Process descendants
+    // may keep those inherited handles open after PowerShell itself has exited.
+    child.on("exit", finish);
+    child.on("close", finish);
   });
+}
+
+const managedProcesses = new Map();
+const fileWatchSnapshots = new Map();
+
+function managedProcessName(name) {
+  const normalized = String(name || "").trim();
+  if (!/^[a-zA-Z0-9._-]{1,64}$/.test(normalized)) {
+    throw new Error("Process name must use 1-64 letters, numbers, dots, underscores, or hyphens.");
+  }
+  return normalized;
+}
+
+function processIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function managedProcessStorePath() {
+  return join(resolve(process.cwd()), ".deepseek-watch", "processes.json");
+}
+
+function normalizeManagedProcessRecord(value) {
+  if (!value || typeof value !== "object") return null;
+  const name = String(value.name || "").trim();
+  if (!/^[a-zA-Z0-9._-]{1,64}$/.test(name)) return null;
+  const pid = Number(value.pid);
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  if (!["cmd", "powershell"].includes(value.shell)) return null;
+  if (typeof value.command !== "string" || typeof value.workdir !== "string") return null;
+  if (typeof value.stdout_log !== "string" || typeof value.stderr_log !== "string") return null;
+  if (typeof value.started_at !== "string") return null;
+  return { name, pid, shell: value.shell, command: value.command, workdir: value.workdir, stdout_log: value.stdout_log, stderr_log: value.stderr_log, started_at: value.started_at };
+}
+
+async function loadManagedProcesses() {
+  const storePath = managedProcessStorePath();
+  managedProcesses.clear();
+  try {
+    const parsed = JSON.parse(await readFile(storePath, "utf8"));
+    const records = Array.isArray(parsed?.processes) ? parsed.processes : [];
+    for (const value of records) {
+      const record = normalizeManagedProcessRecord(value);
+      if (record) managedProcesses.set(record.name, record);
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw new Error(`Could not read managed process store: ${error.message}`);
+  }
+}
+
+async function saveManagedProcesses() {
+  const processes = [...managedProcesses.values()]
+    .sort((left, right) => left.name.localeCompare(right.name));
+  await atomicWriteFile(managedProcessStorePath(), `${JSON.stringify({ version: 1, processes }, null, 2)}\n`);
+}
+
+function processRecordWithStatus(record) {
+  return { ...record, running: processIsAlive(record.pid) };
+}
+
+function waitForHttpReady(url, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolvePromise) => {
+    const check = async () => {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), Math.min(3000, timeoutMs));
+        const response = await fetch(url, { signal: controller.signal });
+        clearTimeout(timer);
+        if (response.ok) return resolvePromise({ ready: true, status: response.status });
+      } catch {}
+      if (Date.now() >= deadline) return resolvePromise({ ready: false });
+      setTimeout(check, 250);
+    };
+    check();
+  });
+}
+
+async function manageProcess(args) {
+  // Processes outlive a wrapper invocation. Reload before every operation so
+  // a later `d` session can inspect or stop a server started by an earlier one.
+  await loadManagedProcesses();
+  const action = String(args.action || "list").toLowerCase();
+  if (action === "list") {
+    return [...managedProcesses.values()].map(processRecordWithStatus);
+  }
+
+  const name = managedProcessName(args.name);
+  const existing = managedProcesses.get(name);
+  if (action === "status") {
+    if (!existing) return { name, found: false };
+    return { ...processRecordWithStatus(existing), found: true };
+  }
+
+  if (action === "stop") {
+    if (!existing) return { name, found: false, stopped: false };
+    if (processIsAlive(existing.pid)) {
+      if (process.platform === "win32") {
+        await new Promise((resolvePromise) => {
+          const killer = spawn("taskkill.exe", ["/pid", String(existing.pid), "/t", "/f"], { windowsHide: true, stdio: "ignore" });
+          killer.once("error", resolvePromise);
+          killer.once("exit", resolvePromise);
+        });
+      } else {
+        try { process.kill(-existing.pid, "SIGTERM"); } catch { try { process.kill(existing.pid, "SIGTERM"); } catch {} }
+      }
+    }
+    managedProcesses.delete(name);
+    await saveManagedProcesses();
+    return { name, found: true, stopped: true };
+  }
+
+  if (action !== "start") throw new Error("action must be start, stop, status, or list.");
+  if (existing && processIsAlive(existing.pid)) throw new Error(`Managed process '${name}' is already running (pid ${existing.pid}).`);
+  const command = String(args.command || "").trim();
+  if (!command) throw new Error("command is required when action is start.");
+  const shell = args.shell === "cmd" ? "cmd" : "powershell";
+  const cwd = args.workdir ? assertInsideWorkspace(args.workdir) : resolve(process.cwd());
+  const logDir = join(resolve(process.cwd()), ".deepseek-watch", "processes");
+  await mkdir(logDir, { recursive: true });
+  const stdoutPath = join(logDir, `${name}.stdout.log`);
+  const stderrPath = join(logDir, `${name}.stderr.log`);
+  const stdoutFd = openSync(stdoutPath, "a");
+  const stderrFd = openSync(stderrPath, "a");
+  const child = spawn(
+    shell === "cmd" ? "cmd.exe" : "powershell.exe",
+    shell === "cmd" ? ["/d", "/s", "/c", command] : ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+    { cwd, detached: true, windowsHide: true, stdio: ["ignore", stdoutFd, stderrFd] }
+  );
+  closeSync(stdoutFd);
+  closeSync(stderrFd);
+  child.unref();
+  const record = {
+    name,
+    pid: child.pid,
+    shell,
+    command,
+    workdir: relative(resolve(process.cwd()), cwd).replaceAll("\\", "/") || ".",
+    stdout_log: relative(resolve(process.cwd()), stdoutPath).replaceAll("\\", "/"),
+    stderr_log: relative(resolve(process.cwd()), stderrPath).replaceAll("\\", "/"),
+    started_at: nowIso()
+  };
+  managedProcesses.set(name, record);
+  await saveManagedProcesses();
+  const readyUrl = String(args.ready_url || "").trim();
+  const readiness = readyUrl ? await waitForHttpReady(readyUrl, Math.min(Math.max(Number(args.ready_timeout_ms) || 30000, 1000), 300000)) : null;
+  return { ...record, started: true, running: processIsAlive(child.pid), ...(readiness ? { readiness } : {}) };
+}
+
+async function snapshotWatchedPath(absPath, recursive) {
+  const entries = new Map();
+  const addEntry = async (target, relPath) => {
+    const info = await stat(target);
+    if (!info.isFile()) return;
+    entries.set(relPath.replaceAll("\\", "/"), { size: info.size, mtime_ms: Math.trunc(info.mtimeMs) });
+  };
+  const info = await stat(absPath);
+  if (info.isFile()) {
+    await addEntry(absPath, ".");
+    return entries;
+  }
+  if (!info.isDirectory()) throw new Error("file_watch path must be a file or directory.");
+  const visit = async (dir, prefix = "") => {
+    const children = await readdir(dir, { withFileTypes: true });
+    for (const child of children) {
+      if ([".git", "node_modules", ".deepseek-watch"].includes(child.name)) continue;
+      const childPath = join(dir, child.name);
+      const relPath = prefix ? `${prefix}/${child.name}` : child.name;
+      if (child.isFile()) await addEntry(childPath, relPath);
+      else if (recursive && child.isDirectory()) await visit(childPath, relPath);
+    }
+  };
+  await visit(absPath);
+  return entries;
+}
+
+async function checkFileWatch(absPath, key, recursive, reset, maxChanges) {
+  const current = await snapshotWatchedPath(absPath, recursive);
+  const previous = fileWatchSnapshots.get(key);
+  fileWatchSnapshots.set(key, current);
+  if (reset || !previous) return { initialized: true, changes: [], tracked_files: current.size };
+  const changes = [];
+  for (const [path, details] of current) {
+    const before = previous.get(path);
+    if (!before) changes.push({ type: "created", path, ...details });
+    else if (before.size !== details.size || before.mtime_ms !== details.mtime_ms) changes.push({ type: "modified", path, ...details });
+  }
+  for (const path of previous.keys()) if (!current.has(path)) changes.push({ type: "deleted", path });
+  return { initialized: false, changes: changes.slice(0, maxChanges), total_changes: changes.length, tracked_files: current.size };
+}
+
+async function projectMemory(action, key, value) {
+  const memoryPath = join(resolve(process.cwd()), ".deepseek-watch", "project-memory.json");
+  let memory = { version: 1, entries: {} };
+  try {
+    const parsed = JSON.parse(await readFile(memoryPath, "utf8"));
+    if (parsed && typeof parsed === "object" && parsed.entries && typeof parsed.entries === "object") memory = parsed;
+  } catch (error) {
+    if (error.code !== "ENOENT") throw new Error(`Could not read project memory: ${error.message}`);
+  }
+  const operation = String(action || "get").toLowerCase();
+  if (operation === "list") return Object.entries(memory.entries).map(([entryKey, entry]) => ({ key: entryKey, updated_at: entry.updated_at || "" }));
+  const normalizedKey = String(key || "").trim();
+  if (!normalizedKey) throw new Error("key is required unless action is list.");
+  if (operation === "get") return memory.entries[normalizedKey] || null;
+  if (operation === "set") {
+    memory.entries[normalizedKey] = { value, updated_at: nowIso() };
+    await atomicWriteFile(memoryPath, `${JSON.stringify(memory, null, 2)}\n`);
+    return { key: normalizedKey, ...memory.entries[normalizedKey] };
+  }
+  if (operation === "delete") {
+    const existed = Object.prototype.hasOwnProperty.call(memory.entries, normalizedKey);
+    delete memory.entries[normalizedKey];
+    await atomicWriteFile(memoryPath, `${JSON.stringify(memory, null, 2)}\n`);
+    return { key: normalizedKey, deleted: existed };
+  }
+  throw new Error("action must be get, set, delete, or list.");
+}
+
+async function packageScriptNames() {
+  try {
+    const pkg = JSON.parse(await readFile(join(resolve(process.cwd()), "package.json"), "utf8"));
+    return Object.keys(pkg.scripts || {});
+  } catch {
+    return [];
+  }
+}
+
+async function runNamedPackageScripts(preferredNames, timeoutMs) {
+  const available = await packageScriptNames();
+  const selected = preferredNames.filter((name) => available.includes(name));
+  if (!selected.length) return { found: false, available_scripts: available, results: [] };
+  const results = [];
+  for (const script of selected) {
+    if (!/^[a-zA-Z0-9:_-]+$/.test(script)) throw new Error(`Unsupported npm script name: ${script}`);
+    const command = process.platform === "win32" ? "cmd.exe" : "npm";
+    const commandArgs = process.platform === "win32"
+      ? ["/d", "/s", "/c", `npm run ${script}`]
+      : ["run", script];
+    results.push({ script, result: await runLocalCommand(command, commandArgs, timeoutMs, process.cwd()) });
+  }
+  return { found: true, results };
+}
+
+async function semanticSearchWorkspace(query, maxResults) {
+  const terms = [...new Set(String(query || "").toLowerCase().match(/[a-z0-9_./-]{2,}/g) || [])].slice(0, 12);
+  if (!terms.length) throw new Error("query must include at least one searchable term.");
+  const results = [];
+  let scanned = 0;
+  const workspace = resolve(process.cwd());
+  for await (const item of walkDir(workspace, workspace, { type: "file" })) {
+    if (++scanned > 2000) break;
+    if (await isBinaryFile(item.absPath)) continue;
+    let text;
+    try { text = (await readFile(item.absPath, "utf8")).slice(0, 1_000_000); } catch { continue; }
+    const lower = text.toLowerCase();
+    let score = 0;
+    const matches = [];
+    for (const term of terms) {
+      const count = lower.split(term).length - 1;
+      if (count) {
+        score += Math.min(count, 20);
+        if (item.relPath.toLowerCase().includes(term)) score += 8;
+        matches.push({ term, count });
+      }
+    }
+    if (!score) continue;
+    const first = terms.map((term) => lower.indexOf(term)).filter((index) => index >= 0).sort((a, b) => a - b)[0];
+    results.push({ path: item.relPath, score, matches, snippet: text.slice(Math.max(0, first - 120), first + 360).replace(/\s+/g, " ").trim() });
+  }
+  return { query, terms, scanned_files: scanned, results: results.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path)).slice(0, maxResults) };
+}
+
+async function planReview() {
+  const repository = await runGit(["rev-parse", "--is-inside-work-tree"]);
+  if (!repository.ok || repository.out.trim() !== "true") {
+    return {
+      git_repository: false,
+      git_status: "",
+      diff_stat: "",
+      whitespace_clean: null,
+      whitespace_findings: "Skipped: workspace is not a Git repository.",
+      review_checklist: [
+        "Confirm changed files are in scope and no unrelated edits are included.",
+        "Run diagnostics or tests appropriate to the touched code.",
+        "Check error paths, timeouts, and permission boundaries for behavior changes.",
+        "Summarize user-visible behavior and any remaining risks before handoff."
+      ]
+    };
+  }
+  const [status, statSummary, whitespace] = await Promise.all([
+    runGit(["status", "--short", "--branch"]),
+    runGit(["diff", "--stat"]),
+    runGit(["diff", "--check"])
+  ]);
+  return {
+    git_repository: true,
+    git_status: status.out.trim(),
+    diff_stat: statSummary.out.trim(),
+    whitespace_clean: whitespace.ok,
+    whitespace_findings: whitespace.ok ? "" : (whitespace.out || whitespace.err).trim(),
+    review_checklist: [
+      "Confirm changed files are in scope and no unrelated edits are included.",
+      "Run diagnostics or tests appropriate to the touched code.",
+      "Check error paths, timeouts, and permission boundaries for behavior changes.",
+      "Summarize user-visible behavior and any remaining risks before handoff."
+    ]
+  };
 }
 
 function commandStatus(command, args = ["--version"]) {
@@ -2425,6 +3132,9 @@ async function doctor() {
   const googleSearchEngineId = process.env.GOOGLE_SEARCH_ENGINE_ID || process.env.GOOGLE_CSE_ID || "";
   const braveSearchKey = process.env.BRAVE_SEARCH_API_KEY || "";
   const skills = await discoverSkills({});
+  const skillRootsText = skillRootsWithSources({})
+    .map(({ root, source }) => `${source}: ${root}`)
+    .join("\n           ");
   const dswStatus = commandStatus("dsw", ["--help"]);
   const pbcStatus = commandStatus("pbc", ["--help"]);
   const lines = [
@@ -2462,11 +3172,21 @@ async function doctor() {
     `  pbc on PATH: ${pbcStatus.ok ? "yes" : "no"}`,
     "",
     "Skills",
-    `  discovered: ${skills.length}`,
-    ...skills.slice(0, 8).map((skill) => `  - ${skill.name}: ${skill.path}`),
+    `  roots: ${skillRootsText}`,
+    `  discovered: ${skills.length}${skills.some((skill) => !skill.enabled) ? ` (${skills.filter((skill) => !skill.enabled).length} disabled)` : ""}`,
+    ...skills.slice(0, 8).map((skill) => `  - ${skill.name} [${skill.source}${skill.enabled ? "" : ", disabled"}]: ${skill.path}`),
     skills.length > 8 ? `  ... ${skills.length - 8} more` : ""
   ].filter((line) => line !== "");
   return lines.join("\n");
+}
+
+// Shell tools accept a working directory: absolute paths are used as-is,
+// relative paths resolve against the workspace root.
+function resolveShellCwd(value) {
+  if (!value) return resolve(process.cwd());
+  const text = String(value).trim();
+  if (!text) return resolve(process.cwd());
+  return isAbsolute(text) ? resolve(text) : assertInsideWorkspace(text);
 }
 
 async function maybeRunShellTool(opts, shellName, command, timeoutMs, cwd = process.cwd()) {
@@ -2487,6 +3207,11 @@ async function maybeRunShellTool(opts, shellName, command, timeoutMs, cwd = proc
 function activeSession(opts) {
   if (!opts.sessionObject) throw new Error("No active session object.");
   return opts.sessionObject;
+}
+
+function activeAgentRuntime(opts) {
+  if (!opts.agentRuntime) throw new Error("Agent coordination is not initialized for this session.");
+  return opts.agentRuntime;
 }
 
 function validatePlanItems(plan) {
@@ -2544,6 +3269,184 @@ function handoffCliArgs(cli, prompt, promptFile, cliArgs) {
 
 async function runTool(opts, name, args) {
   if (name === "get_runtime_context") return runtimeContext();
+
+  if (name === "agent_identity") {
+    return jsonResult(activeAgentRuntime(opts).record);
+  }
+
+  if (name === "agent_list") {
+    return jsonResult(await listAgents(opts.coordDir, { includeStopped: args.include_stopped === true }));
+  }
+
+  if (name === "agent_send") {
+    const message = await sendAgentMessage(opts.coordDir, {
+      from: opts.agentId,
+      to: args.to,
+      body: args.message,
+      type: args.type,
+      priority: args.priority,
+      taskId: args.task_id,
+      replyTo: args.reply_to
+    });
+    return jsonResult(message);
+  }
+
+  if (name === "agent_check_inbox") {
+    return jsonResult(await readAgentInbox(opts.coordDir, opts.agentId, { max: args.max }));
+  }
+
+  if (name === "agent_task_create") {
+    if (opts.agentRole !== "coordinator") throw new Error("agent_task_create requires --agent-role coordinator.");
+    return jsonResult(await createTask(opts.coordDir, {
+      taskId: args.task_id,
+      title: args.title,
+      description: args.description,
+      scope: args.scope,
+      acceptanceCriteria: args.acceptance_criteria,
+      dependsOn: args.depends_on,
+      createdBy: opts.agentId
+    }));
+  }
+
+  if (name === "agent_task_list") {
+    return jsonResult(await listTasks(opts.coordDir));
+  }
+
+  if (name === "agent_claim") {
+    const claim = await claimTask(opts.coordDir, {
+      taskId: args.task_id,
+      agentId: opts.agentId,
+      leaseSeconds: args.lease_seconds
+    });
+    await activeAgentRuntime(opts).addClaim(args.task_id);
+    return jsonResult(claim);
+  }
+
+  if (name === "agent_handoff") {
+    const task = await completeTask(opts.coordDir, {
+      taskId: args.task_id,
+      agentId: opts.agentId,
+      summary: args.summary,
+      status: args.status
+    });
+    await activeAgentRuntime(opts).removeClaim(args.task_id);
+    let message = null;
+    if (args.to) {
+      message = await sendAgentMessage(opts.coordDir, {
+        from: opts.agentId,
+        to: args.to,
+        body: args.summary,
+        type: "handoff",
+        taskId: args.task_id,
+        priority: "normal"
+      });
+    }
+    return jsonResult({ task, message });
+  }
+
+  if (name === "agent_wait") {
+    const timeoutSeconds = Math.min(Math.max(Number(args.timeout_seconds) || 0, 0), 604800);
+    opts.agentWaitRequest = {
+      reason: String(args.reason || "Waiting for another agent."),
+      timeoutMs: timeoutSeconds > 0 ? timeoutSeconds * 1000 : 0,
+      requestedAt: nowIso()
+    };
+    return timeoutSeconds > 0
+      ? `Agent ${opts.agentId} will park after this tool batch for up to ${timeoutSeconds} seconds.`
+      : `Agent ${opts.agentId} will park after this tool batch until a message arrives.`;
+  }
+
+  if (name === "compact_session") {
+    const session = activeSession(opts);
+    const meta = await compactSession({ ...opts, compactForce: Boolean(args.force) }, session);
+    if (opts.saveSession) await writeSession(opts.session, touchSession(session));
+    return jsonResult(meta || { compacted: false, usage: estimateContextTokens(session.messages) });
+  }
+
+  if (name === "agent_compact") {
+    return jsonResult(await compactAgentSession(opts, args));
+  }
+
+  if (name === "spawn_agent") return jsonResult(await spawnSwarmAgent(opts, args, { resume: false }));
+  if (name === "resume_agent") return jsonResult(await spawnSwarmAgent(opts, args, { resume: true }));
+
+  if (name === "classify_url") return jsonResult(classifyUrl(args.url));
+
+  if (name === "verify_download") {
+    return jsonResult(await verifyDownload(args.input, { quarantineDir: args.quarantine_dir }));
+  }
+
+  if (name === "watch_downloads") return jsonResult(await watchDownloads(args.since));
+
+  if (name === "track_bypass_state") {
+    const hasValue = Object.prototype.hasOwnProperty.call(args, "value");
+    return jsonResult({ key: String(args.key), value: await trackSafetyState(args.key, hasValue ? args.value : undefined) });
+  }
+
+  if (name === "scan_download_hash") return jsonResult(await virusTotalLookup(args.hash));
+  if (name === "virus_total") return jsonResult(await virusTotalLookup(args.value));
+  if (name === "whois_lookup") return jsonResult(await whoisLookup(args.domain));
+  if (name === "dns_lookup") return jsonResult(await dnsLookup(args.domain));
+  if (name === "cert_logs") return jsonResult(await certLogs(args.domain));
+
+  if (name === "file_analyze") {
+    const target = assertInsideWorkspace(args.path);
+    return jsonResult(await fileAnalyze(target));
+  }
+
+  if (name === "file_watch") {
+    const target = assertInsideWorkspace(args.path);
+    const recursive = args.recursive !== false;
+    const maxChanges = Math.min(Math.max(Number(args.max_changes) || 200, 1), 2000);
+    return jsonResult(await checkFileWatch(target, `${target}|${recursive}`, recursive, args.reset === true, maxChanges));
+  }
+
+  if (name === "project_memory") {
+    const action = String(args.action || "get").toLowerCase();
+    if (["set", "delete"].includes(action)) {
+      if (opts.permission === "review") return "blocked by session permission: review only";
+      if (opts.permission !== "full" && !opts.dangerouslyAutoRunCommands) {
+        if (opts.noOutput) return "blocked by no-output mode";
+        const ok = await askYesNo(`${action === "set" ? "Store" : "Delete"} project memory key '${String(args.key || "")}'?`);
+        if (!ok) return "blocked by user";
+      }
+    }
+    return jsonResult(await projectMemory(action, args.key, args.value));
+  }
+
+  if (name === "diagnostics" || name === "run_tests") {
+    if (opts.permission === "review") return "blocked by session permission: review only";
+    if (opts.permission !== "full" && !opts.dangerouslyAutoRunCommands) {
+      if (opts.noOutput) return "blocked by no-output mode";
+      const scripts = name === "diagnostics" ? "lint, typecheck, and check" : "test";
+      const ok = await askYesNo(`Run configured npm ${scripts} script(s)?`);
+      if (!ok) return "blocked by user";
+    }
+    const timeout = Math.min(Math.max(Number(args.timeout_ms) || 120000, 1000), 600000);
+    const scripts = name === "diagnostics" ? ["lint", "typecheck", "check"] : ["test"];
+    return jsonResult(await runNamedPackageScripts(scripts, timeout));
+  }
+
+  if (name === "semantic_search") {
+    const maxResults = Math.min(Math.max(Number(args.max_results) || 20, 1), 100);
+    return jsonResult(await semanticSearchWorkspace(args.query, maxResults));
+  }
+
+  if (name === "plan_review") return jsonResult(await planReview());
+
+  if (name === "process_manage") {
+    const action = String(args.action || "list").toLowerCase();
+    if (["start", "stop"].includes(action)) {
+      if (opts.permission === "review") return "blocked by session permission: review only";
+      if (opts.permission !== "full" && !opts.dangerouslyAutoRunCommands) {
+        if (opts.noOutput) return "blocked by no-output mode";
+        const detail = action === "start" ? `\nCommand: ${String(args.command || "")}` : "";
+        const ok = await askYesNo(`${action === "start" ? "Start" : "Stop"} managed process '${String(args.name || "")}'?${detail}`);
+        if (!ok) return "blocked by user";
+      }
+    }
+    return jsonResult(await manageProcess(args));
+  }
 
   if (name === "create_goal") {
     const session = activeSession(opts);
@@ -2865,39 +3768,108 @@ async function runTool(opts, name, args) {
     return `Wrote ${args.path} (${args.content.length} chars)`;
   }
 
+// ── EOL-tolerant exact patching ──────────────────────────────────────────────
+// patch_text_file / patch_files historically required byte-exact old_string
+// matches, including CRLF vs LF. On Windows checkouts that produces the
+// classic "old_string not found" loop. These helpers try the byte-exact match
+// first, then fall back to a CRLF/LF-insensitive match, and write inserted
+// text using the file's dominant line ending so the rest of the file is
+// untouched.
+
+function detectEol(content) {
+  return content.includes("\r\n") ? "\r\n" : "\n";
+}
+
+function normalizeEolMap(content) {
+  const normChars = [];
+  const origStart = [];
+  const origEnd = [];
+  for (let i = 0; i < content.length; i++) {
+    if (content.charCodeAt(i) === 13 && content.charCodeAt(i + 1) === 10) {
+      normChars.push("\n");
+      origStart.push(i);
+      origEnd.push(i + 2);
+      i += 1;
+    } else {
+      normChars.push(content[i]);
+      origStart.push(i);
+      origEnd.push(i + 1);
+    }
+  }
+  return { norm: normChars.join(""), origStart, origEnd };
+}
+
+function normIncludes(content, needle) {
+  if (content.includes(needle)) return true;
+  return content.replace(/\r\n/g, "\n").includes(String(needle).replace(/\r\n/g, "\n"));
+}
+
+function patchEolTolerant(content, oldString, newString, { replaceAll = false } = {}) {
+  newString = String(newString == null ? "" : newString);
+  // Fast path: byte-exact match (respects the documented behavior).
+  if (content.includes(oldString)) {
+    if (replaceAll) {
+      const parts = content.split(oldString);
+      return { content: parts.join(newString), count: parts.length - 1 };
+    }
+    return { content: content.replace(oldString, newString), count: 1 };
+  }
+  // CRLF/LF tolerant fallback: match on normalized text, splice the original.
+  const fileEol = detectEol(content);
+  const { norm, origStart, origEnd } = normalizeEolMap(content);
+  const normOld = oldString.replace(/\r\n/g, "\n");
+  const indices = [];
+  let from = 0;
+  while (true) {
+    const idx = norm.indexOf(normOld, from);
+    if (idx === -1) break;
+    indices.push(idx);
+    from = idx + Math.max(normOld.length, 1);
+  }
+  if (!indices.length) return null;
+  const normNew = newString.replace(/\r\n/g, "\n").replace(/\n/g, fileEol);
+  const targets = replaceAll ? indices : indices.slice(0, 1);
+  let out = content;
+  for (let i = targets.length - 1; i >= 0; i--) {
+    const idx = targets[i];
+    const start = origStart[idx];
+    const end = origEnd[idx + normOld.length - 1];
+    out = out.slice(0, start) + normNew + out.slice(end);
+  }
+  return { content: out, count: targets.length };
+}
+
   if (name === "patch_text_file") {
     if (opts.permission === "review") return "blocked by session permission: review only";
     const target = assertInsideWorkspace(args.path);
     const info = await stat(target);
     if (!info.isFile()) throw new Error("Path is not a file.");
     const content = await readFile(target, "utf8");
-    if (!content.includes(args.old_string)) throw new Error("old_string not found in file.");
+    const replaceAll = args.replace_all === true;
+    const patched = patchEolTolerant(content, args.old_string, args.new_string, { replaceAll });
+    if (!patched) throw new Error("old_string not found in file.");
     if (opts.permission !== "full" && !opts.dangerouslyAutoRunCommands) {
       if (opts.noOutput) return "blocked by no-output mode";
       const preview = args.old_string.slice(0, 120);
       const ok = await askYesNo(`Patch ${args.path}?\nReplace: ${preview}${args.old_string.length > 120 ? "…" : ""}`);
       if (!ok) return "blocked by user";
     }
-    const replaceAll = args.replace_all === true;
-    const newContent = replaceAll
-      ? content.split(args.old_string).join(args.new_string)
-      : content.replace(args.old_string, args.new_string);
-    const count = replaceAll ? content.split(args.old_string).length - 1 : 1;
-    await atomicWriteFile(target, newContent);
+    const count = patched.count;
+    await atomicWriteFile(target, patched.content);
     opts.touchedFiles?.add(args.path);
     return `Patched ${args.path} (${count} replacement${count !== 1 ? "s" : ""})`;
   }
 
   if (name === "run_cmd") {
-    return maybeRunShellTool(opts, "cmd", args.command, args.timeout_ms);
+    return maybeRunShellTool(opts, "cmd", args.command, args.timeout_ms, resolveShellCwd(args.path));
   }
 
   if (name === "run_powershell") {
-    return maybeRunShellTool(opts, "powershell", args.command, args.timeout_ms);
+    return maybeRunShellTool(opts, "powershell", args.command, args.timeout_ms, resolveShellCwd(args.path));
   }
 
   if (name === "functions_shell_command" || name === "functions.shell_command") {
-    const cwd = args.workdir ? assertInsideWorkspace(args.workdir) : resolve(process.cwd());
+    const cwd = resolveShellCwd(args.workdir);
     return maybeRunShellTool(opts, "powershell", args.command, args.timeout_ms ?? 120000, cwd);
   }
 
@@ -3030,21 +4002,36 @@ async function runTool(opts, name, args) {
     if (opts.permission === "review") return "blocked by session permission: review only";
     const edits = Array.isArray(args.edits) ? args.edits : [];
     if (!edits.length) return "No edits provided.";
-    const preflights = await Promise.all(edits.map(async (edit) => {
+
+    // Group edits by resolved target path, preserving input order within each group,
+    // so multiple edits to the SAME file apply sequentially instead of clobbering
+    // each other with stale preflight content (last-edit-wins bug).
+    const groups = new Map();
+    const failures = [];
+    for (const edit of edits) {
+      let target;
       try {
-        const target = assertInsideWorkspace(edit.path);
+        target = assertInsideWorkspace(edit.path);
         const info = await stat(target);
-        if (!info.isFile()) return { edit, ok: false, error: "not a file", target: null, content: null };
-        const content = await readFile(target, "utf8");
-        if (!content.includes(edit.old_string)) return { edit, ok: false, error: "old_string not found", target, content };
-        return { edit, ok: true, error: null, target, content };
+        if (!info.isFile()) { failures.push({ path: edit.path, error: "not a file" }); continue; }
       } catch (e) {
-        return { edit, ok: false, error: e.message, target: null, content: null };
+        failures.push({ path: edit.path, error: e.message });
+        continue;
       }
-    }));
-    const failures = preflights.filter((p) => !p.ok);
+      let group = groups.get(target);
+      if (!group) {
+        let content;
+        try { content = await readFile(target, "utf8"); } catch (e) { failures.push({ path: edit.path, error: e.message }); continue; }
+        group = { path: edit.path, target, content, edits: [] };
+        groups.set(target, group);
+      }
+      group.edits.push(edit);
+      if (!normIncludes(group.content, edit.old_string)) {
+        failures.push({ path: edit.path, error: "old_string not found" });
+      }
+    }
     if (failures.length) {
-      return `Preflight failed — no files written:\n${failures.map((f) => `  ${f.edit.path}: ${f.error}`).join("\n")}`;
+      return `Preflight failed — no files written:\n${failures.map((f) => `  ${f.path}: ${f.error}`).join("\n")}`;
     }
     if (opts.permission !== "full" && !opts.dangerouslyAutoRunCommands) {
       if (opts.noOutput) return "blocked by no-output mode";
@@ -3052,16 +4039,30 @@ async function runTool(opts, name, args) {
       const ok = await askYesNo(`Patch ${edits.length} file${edits.length !== 1 ? "s" : ""}?\n${preview}`);
       if (!ok) return "blocked by user";
     }
-    const written = [];
-    for (const { edit, content, target } of preflights) {
-      const newContent = edit.replace_all
-        ? content.split(edit.old_string).join(edit.new_string)
-        : content.replace(edit.old_string, edit.new_string);
-      await atomicWriteFile(target, newContent);
-      opts.touchedFiles?.add(edit.path);
-      written.push(`  ${edit.path}`);
+
+    // Apply edits per file in memory first; only write files when every edit succeeds.
+    const applied = [];
+    for (const group of groups.values()) {
+      let content = group.content;
+      let count = 0;
+      for (const edit of group.edits) {
+        const result = patchEolTolerant(content, edit.old_string, edit.new_string, { replaceAll: edit.replace_all === true });
+        if (!result) {
+          return `Preflight failed — no files written:\n  ${group.path}: old_string no longer matches after an earlier edit to the same file`;
+        }
+        content = result.content;
+        count += result.count;
+      }
+      applied.push({ path: group.path, target: group.target, newContent: content, count });
     }
-    return `Patched ${written.length} file${written.length !== 1 ? "s" : ""}:\n${written.join("\n")}`;
+
+    for (const item of applied) {
+      await atomicWriteFile(item.target, item.newContent);
+      opts.touchedFiles?.add(item.path);
+    }
+    const fileCount = applied.length;
+    const editCount = edits.length;
+    return `Patched ${fileCount} file${fileCount !== 1 ? "s" : ""} (${editCount} edit${editCount !== 1 ? "s" : ""}):\n${applied.map((a) => `  ${a.path} (${a.count} replacement${a.count !== 1 ? "s" : ""})`).join("\n")}`;
   }
 
   if (name === "cache_set") {
@@ -3139,6 +4140,10 @@ async function runTool(opts, name, args) {
     return lines.join("\n");
   }
 
+  if (name.startsWith("sec_")) {
+    return runSecurityTool(name, args, { ...opts, askYesNo });
+  }
+
   throw new Error(`Unknown tool: ${name}`);
 }
 
@@ -3171,6 +4176,7 @@ async function executeToolCall(opts, call) {
 
 function shouldRunToolsSequentially(opts, calls) {
   if (opts.toolMode === "sequential") return true;
+  if (calls.some((call) => call.function?.name === "agent_wait")) return true;
   if (opts.dangerouslyAutoRunCommands) return false;
   return calls.some((call) => ["run_cmd", "run_powershell", "functions_shell_command", "functions.shell_command"].includes(call.function?.name));
 }
@@ -3249,129 +4255,353 @@ function installStreamInterruptHandler(opts, controller) {
   };
 }
 
-async function streamChat(opts, messages) {
+async function streamChat(opts, messages, toolsEnabled = opts.tools) {
   const apiKey = await getDeepSeekApiKey();
   if (!apiKey) throw new Error("No DeepSeek API key found. Run: dsw config set-key <key>");
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), opts.timeout);
-  const cleanupInterrupt = installStreamInterruptHandler(opts, controller);
-  const toolCalls = [];
-  let content = "";
-  let reasoningContent = "";
-  let phase = "";
-  let status = createStatusLine(opts, randomStatusPhrase());
-  const ensureToolStatus = () => {
-    if (status.isActive()) return status;
-    status = createStatusLine(opts, "Preparing tools");
-    return status;
-  };
-  try {
-    const body = {
-      model: opts.model,
-      messages,
-      stream: true,
-      max_tokens: opts.maxTokens
+  // One attempt per iteration. Transient failures (network blips, per-attempt
+  // timeouts, HTTP 429/5xx) retry with exponential backoff instead of taking
+  // the CLI down; user interrupts (Esc/Ctrl+C) end the turn with an
+  // interrupted marker. --retry-attempts 0 (default) keeps retrying forever.
+  for (let attempt = 1; ; attempt += 1) {
+    const controller = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, opts.timeout);
+    const cleanupInterrupt = installStreamInterruptHandler(opts, controller);
+    const toolCalls = [];
+    let content = "";
+    let reasoningContent = "";
+    let finishReason = "";
+    let phase = "";
+    let status = createStatusLine(opts, randomStatusPhrase());
+    const reasoningWriter = createMarkdownWriter(opts, (text) => dim(opts, text), { status });
+    const contentWriter = createMarkdownWriter(opts, (text) => applyKnownFileLinks(opts, text, opts.touchedFiles || []), { status });
+    const ensureToolStatus = () => {
+      if (status.isActive()) return status;
+      status = createStatusLine(opts, "Preparing tools");
+      return status;
     };
-    applyThinkingOptions(body, opts);
-    if (opts.tools) body.tools = toolSchemas(opts);
+    try {
+      const body = {
+        model: opts.model,
+        messages,
+        stream: true,
+        max_tokens: opts.maxTokens
+      };
+      applyThinkingOptions(body, opts);
+      if (toolsEnabled) body.tools = toolSchemas(opts);
 
-    const response = await fetch(`${opts.baseUrl.replace(/\/$/, "")}/chat/completions`, {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        "Authorization": `Bearer ${apiKey}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(body)
-    });
+      const response = await fetch(`${opts.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(body)
+      });
 
-    if (!response.ok) throw await deepSeekHttpError(response);
-    const decoder = new TextDecoder();
-    let buffer = "";
+      if (!response.ok) throw await deepSeekHttpError(response);
+      const decoder = new TextDecoder();
+      let buffer = "";
 
-    for await (const chunk of response.body) {
-      buffer += decoder.decode(chunk, { stream: true });
-      const lines = buffer.split(/\r?\n/);
-      buffer = lines.pop() || "";
+      for await (const chunk of response.body) {
+        buffer += decoder.decode(chunk, { stream: true });
+        const lines = buffer.split(/\r?\n/);
+        buffer = lines.pop() || "";
 
-      for (const line of lines) {
-        if (!line.startsWith("data:")) continue;
-        const payload = line.slice(5).trim();
-        if (!payload || payload === "[DONE]") continue;
-        const data = JSON.parse(payload);
-        const delta = data.choices?.[0]?.delta || {};
+        for (const line of lines) {
+          if (!line.startsWith("data:")) continue;
+          const payload = line.slice(5).trim();
+          if (!payload || payload === "[DONE]") continue;
+          const data = JSON.parse(payload);
+          const choice = data.choices?.[0] || {};
+          const delta = choice.delta || {};
+          if (choice.finish_reason) finishReason = choice.finish_reason;
 
-        if (delta.reasoning_content) {
-          status.addTokens(delta.reasoning_content);
-          status.stop();
-          if (phase !== "thinking") {
-            heading(opts, "thinking", "thinking");
-            phase = "thinking";
+          if (delta.reasoning_content) {
+            status.addTokens(delta.reasoning_content);
+            if (phase !== "thinking") {
+              heading(opts, "thinking", "thinking");
+              phase = "thinking";
+            }
+            reasoningContent += delta.reasoning_content;
+            if (!opts.noOutput) reasoningWriter.write(delta.reasoning_content);
           }
-          reasoningContent += delta.reasoning_content;
-          if (!opts.noOutput) process.stdout.write(dim(opts, delta.reasoning_content));
-        }
 
-        if (delta.content) {
-          status.addTokens(delta.content);
-          status.stop();
-          if (phase !== "final") {
-            heading(opts, "final", "final");
-            phase = "final";
+          if (delta.content) {
+            status.addTokens(delta.content);
+            if (phase !== "final") {
+              heading(opts, "final", "final");
+              phase = "final";
+            }
+            content += delta.content;
+            if (!opts.noOutput) contentWriter.write(delta.content);
           }
-          content += delta.content;
-          if (!opts.noOutput) process.stdout.write(applyKnownFileLinks(opts, delta.content, opts.touchedFiles || []));
-        }
 
-        if (delta.tool_calls) {
-          const toolStatus = ensureToolStatus();
-          toolStatus.setPhrase("Preparing tools");
-          toolStatus.addTokens(JSON.stringify(delta.tool_calls));
-          mergeToolDelta(toolCalls, delta.tool_calls);
+          if (delta.tool_calls) {
+            const toolStatus = ensureToolStatus();
+            toolStatus.setPhrase("Preparing tools");
+            toolStatus.addTokens(JSON.stringify(delta.tool_calls));
+            mergeToolDelta(toolCalls, delta.tool_calls);
+          }
         }
       }
-    }
 
-    status.stop();
-    if (!opts.noOutput) process.stdout.write("\n");
-    return { role: "assistant", content, reasoning_content: reasoningContent, tool_calls: toolCalls.length ? toolCalls : undefined };
-  } catch (error) {
-    status.stop();
-    if (opts.interrupted || error?.name === "AbortError") {
+      reasoningWriter.flush();
+      contentWriter.flush();
+      status.stop();
       if (!opts.noOutput) process.stdout.write("\n");
+      // Some thinking-model streams end at the token limit with an index-only
+      // tool delta. It is not callable and must not poison the next turn.
+      const validToolCalls = toolCalls.filter((call) => String(call.function?.name || "").trim());
       return {
         role: "assistant",
-        content: content.trim() ? `${content.trim()}\n\n[interrupted by user]` : "[interrupted by user]",
+        content,
         reasoning_content: reasoningContent,
-        interrupted: true
+        finishReason: finishReason || undefined,
+        tool_calls: validToolCalls.length ? validToolCalls : undefined
       };
+    } catch (error) {
+      status.stop();
+      // User interrupt (Esc/Ctrl+C) and aborts that are not the per-attempt
+      // timeout end the turn with an interrupted marker instead of retrying.
+      const userInterrupt = opts.interrupted || (error?.name === "AbortError" && !timedOut);
+      if (userInterrupt) {
+        if (!opts.noOutput) process.stdout.write("\n");
+        return {
+          role: "assistant",
+          content: content.trim() ? `${content.trim()}\n\n[interrupted by user]` : "[interrupted by user]",
+          reasoning_content: reasoningContent,
+          interrupted: true
+        };
+      }
+      const exhausted = Number(opts.retryAttempts) > 0 && attempt >= Number(opts.retryAttempts);
+      if (exhausted || !isRetryableFetchError(error)) throw error;
+      const delay = retryBackoffMs(opts.retryDelay, opts.retryMaxDelay, attempt);
+      if (!opts.noOutput) {
+        const reason = error.status ? `HTTP ${error.status}` : (timedOut ? "timed out" : "fetch failed");
+        heading(opts, `${reason}; retrying this turn in ${Math.round(delay / 1000)}s (attempt ${attempt})`, "warn");
+      }
+      await sleep(delay);
+    } finally {
+      status.stop();
+      cleanupInterrupt();
+      opts.interrupted = false;
+      clearTimeout(timer);
     }
-    throw error;
-  } finally {
-    status.stop();
-    cleanupInterrupt();
-    opts.interrupted = false;
-    clearTimeout(timer);
   }
 }
 
+async function ensureContextCompact(opts, session) {
+  if (opts.compactMethod === "off") return null;
+  let meta;
+  if (opts.compactMethod === "detached") {
+    try {
+      meta = await compactSessionDetached(opts, session);
+    } catch (error) {
+      if (!opts.noOutput) heading(opts, `detached compaction failed (${error.message}); falling back to deterministic truncation`, "warn");
+      meta = await compactSession({ ...opts, compactMethod: "truncate" }, session);
+    }
+  } else {
+    meta = await compactSession(opts, session, {
+      onStart: (plan) => {
+        if (opts.noOutput) return;
+        const budget = plan.messagesBudget || plan.limit;
+        const pct = Math.round(((plan.usageScaled || plan.usage) / budget) * 100);
+        heading(opts, `context ~${pct}% of ${formatCompactCount(budget)} — compacting (${opts.compactMethod === "truncate" ? "deterministic roll-up" : "summarizing old messages"})…`, "warn");
+      }
+    });
+  }
+  if (meta && !opts.noOutput) {
+    const budget = meta.messagesBudget || meta.limit;
+    const pct = Math.round(((meta.usageScaled || meta.usage) / budget) * 100);
+    heading(opts, `context ~${pct}% of ${formatCompactCount(budget)} — auto-compacted (${meta.method}: est ${formatCompactCount(meta.usage)} → ${formatCompactCount(meta.projectedTokens)} tokens, folded ${meta.foldedMessages} messages, kept ${meta.keptMessages})`, "warn");
+  }
+  return meta;
+}
+
+async function compactAgentSession(opts, args) {
+  const target = validateAgentId(args.agent_id);
+  const method = String(args.method || "truncate");
+  if (!["auto", "truncate"].includes(method)) throw new Error("agent_compact method must be auto or truncate.");
+
+  const liveAgents = await listAgents(opts.coordDir);
+  const isLive = liveAgents.some((agent) => agent.agentId === target);
+  if (isLive) {
+    // Running/parked target: the in-memory session is the source of truth, so
+    // ask IT to compact (applied on its next wake/turn; it replies with meta).
+    const message = await sendAgentMessage(opts.coordDir, {
+      from: opts.agentId,
+      to: target,
+      type: "compact",
+      body: JSON.stringify({ method, requestedBy: opts.agentId }),
+      priority: "normal"
+    });
+    return {
+      status: "requested",
+      agent: target,
+      message_id: message.id,
+      note: "Target is live; it will compact on its next wake/turn and reply with the result."
+    };
+  }
+
+  // Stopped/failed/dead target: compact its session file directly so the next
+  // launch resumes compacted. Safe because no live process rewrites the file.
+  const recordPath = join(opts.coordDir, "agents", `${target}.json`);
+  let record;
+  try {
+    record = JSON.parse(await readFile(recordPath, "utf8"));
+  } catch {
+    throw new Error(`unknown agent '${target}' (no coordination record).`);
+  }
+  if (!record.session) throw new Error(`agent '${target}' has no session file on record.`);
+  const session = JSON.parse(await readFile(record.session, "utf8"));
+  const meta = await compactSession(
+    { ...opts, compactMethod: method, compactForce: true, maxTokens: opts.maxTokens || 16384 },
+    session
+  );
+  if (meta) {
+    const original = await readFile(record.session, "utf8");
+    await writeFile(`${record.session}.compact-bak`, original, "utf8");
+    await writeFile(record.session, `${JSON.stringify(session, null, 2)}\n`, "utf8");
+  }
+  return { status: meta ? "compacted_file" : "not_needed", agent: target, session: record.session, meta: meta || null };
+}
+
+// Coordinator-only swarm growth: spawn or resume an agent in its OWN detached
+// PowerShell window (launch.ps1-style) so the current agent keeps working.
+async function spawnSwarmAgent(opts, args, { resume }) {
+  if (opts.agentRole !== "coordinator") {
+    throw new Error("spawn_agent / resume_agent are coordinator-only. Workers may not spawn agents; message the coordinator to scale the swarm.");
+  }
+  const agentId = validateAgentId(args.agent_id);
+  const prompt = String(args.prompt || "").trim();
+  if (!prompt) throw new Error("prompt is required.");
+
+  const records = await coordinationAgentRecords(opts);
+  const existing = records.find((agent) => agent.agentId === agentId);
+
+  if (resume) {
+    if (!existing) throw new Error(`No coordination record for '${agentId}' — use spawn_agent to create it first.`);
+    if (existing.live) throw new Error(`Agent '${agentId}' is currently live (PID ${existing.pid}) — cannot resume while running.`);
+  } else if (existing) {
+    throw new Error(`Agent '${agentId}' already exists (state ${existing.state}) — use resume_agent '${agentId}' to resume it instead.`);
+  }
+
+  const role = String(args.role || "worker").toLowerCase();
+  if (!["coordinator", "worker"].includes(role)) throw new Error("role must be coordinator or worker.");
+  const mission = String(args.mission || "").replace(/'/g, "''");
+  const model = String(args.model || opts.model || "deepseek-v4-flash");
+  const permission = String(args.permission || "full");
+  const coordDir = String(opts.coordDir || coordinationRoot());
+  const cwd = String(process.cwd()).replace(/'/g, "''");
+
+  // Spawn the worker as a DETACHED, headless node process. Console windows
+  // cannot be created reliably from the wrapper context (a node-spawned
+  // powershell/cmd window opens but never executes its command), while a
+  // direct node.exe spawn always runs. `detached: true` + `unref()` makes the
+  // child fully independent of this agent — the coordinator keeps working.
+  const nodeExe = process.execPath;
+  const script = fileURLToPath(new URL("./deepseek-watch.js", import.meta.url));
+  const workerArgs = [
+    script,
+    "--agent-id", agentId,
+    "--agent-role", role,
+    ...(mission ? ["--agent-mission", mission] : []),
+    "--model", model,
+    "--coord-dir", coordDir,
+    "--permission", permission,
+    "--compact-method", "auto",
+    "--compact-at", "0.9",
+    "--compact-limit", "1048576",
+    "-p", prompt
+  ];
+  const child = spawn(nodeExe, workerArgs, { detached: true, stdio: "ignore", windowsHide: true });
+  child.unref();
+
+  // The spawn PID is not proof the worker started: verify by polling the
+  // coordination record for a fresh heartbeat under the agent id.
+  const startedAt = Date.now();
+  let registered = null;
+  const deadline = startedAt + 25000;
+  while (Date.now() < deadline) {
+    try {
+      const record = JSON.parse(await readFile(join(coordDir, "agents", `${agentId}.json`), "utf8"));
+      const heartbeat = Date.parse(record.heartbeatAt || "");
+      if (Number.isFinite(heartbeat) && Date.now() - heartbeat < 20000) {
+        registered = { pid: record.pid, state: record.state, instanceId: record.instanceId, session: record.session || null };
+        break;
+      }
+    } catch {}
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 1000));
+  }
+
+  return {
+    action: resume ? "resumed" : "spawned",
+    agent_id: agentId,
+    role,
+    spawn_pid: child.pid || null,
+    registered: registered ? { pid: registered.pid, state: registered.state, session: registered.session } : null,
+    registered_after_seconds: registered ? Math.round((Date.now() - startedAt) / 1000) : null,
+    coord_dir: coordDir,
+    cwd,
+    note: registered
+      ? `Worker registered (PID ${registered.pid}, ${registered.state}). Runs headless/detached — verify with agent_list; message or wake it by id. For tiled windows, use launch.ps1 from a terminal instead.`
+      : "No heartbeat seen within 25s — check for startup errors (API key, model, session file)."
+  };
+}
+
 async function processAgentTurns(opts, session) {
+  let emptyRecoveryAttempts = 0;
   for (let turn = 0; opts.maxToolTurns === null || turn <= opts.maxToolTurns; turn += 1) {
-    const assistant = await streamChat(opts, session.messages);
+    const compacted = await ensureContextCompact(opts, session);
+    if (compacted && opts.saveSession) await writeSession(opts.session, touchSession(session));
+    const response = await streamChat(opts, session.messages);
+    const { finishReason, ...assistant } = response;
     session.messages.push(assistant);
     if (opts.saveSession) await writeSession(opts.session, touchSession(session));
 
     if (assistant.interrupted) return;
-    if (!assistant.tool_calls?.length) return;
+    if (!assistant.tool_calls?.length) {
+      const hasUsableContent = Boolean(String(assistant.content || "").trim());
+      const exhaustedThinking = Boolean(String(assistant.reasoning_content || "").trim()) && !hasUsableContent;
+      if (exhaustedThinking && emptyRecoveryAttempts < 2) {
+        emptyRecoveryAttempts += 1;
+        const previousLimit = opts.maxTokens;
+        opts.maxTokens = Math.min(Math.max(previousLimit * 2, 16384), 32768);
+        session.messages.push({
+          role: "user",
+          content: "Your prior turn used its response budget before producing a usable answer or tool call. Continue the current task now. Be concise and issue the next required tool call immediately; do not repeat prior analysis."
+        });
+        if (opts.saveSession) await writeSession(opts.session, touchSession(session));
+        if (!opts.noOutput) heading(opts, `retrying after empty ${finishReason || "model"} response with ${opts.maxTokens} tokens`, "warn");
+        continue;
+      }
+      return;
+    }
+    emptyRecoveryAttempts = 0;
     heading(opts, "tool calls", "tools");
 
+    const toolTracker = new ToolCallTracker(opts);
     const sequential = shouldRunToolsSequentially(opts, assistant.tool_calls);
+    const trackerIds = new Map();
+    for (const call of assistant.tool_calls) trackerIds.set(call.id, toolTracker.addCall(call));
+
+    const isToolError = (result) => String(result || "").startsWith("Tool error:");
     let executions = [];
     if (!sequential) {
       const status = createStatusLine(opts, "Running tools", assistant.tool_calls.reduce((sum, call) => sum + estimateTokens(call.function?.arguments || ""), 0));
       try {
-        executions = await Promise.all(assistant.tool_calls.map((call) => executeToolCall(opts, call)));
+        executions = await Promise.all(assistant.tool_calls.map(async (call) => {
+          const startedAt = Date.now();
+          const execution = await executeToolCall(opts, call);
+          execution.durationMs = Date.now() - startedAt;
+          return execution;
+        }));
       } finally {
         status.stop();
       }
@@ -3381,24 +4611,212 @@ async function processAgentTurns(opts, session) {
       let execution;
       if (sequential) {
         const status = createStatusLine(opts, toolStatusPhrase(call.function?.name || "tool"), estimateTokens(call.function?.arguments || ""));
+        const startedAt = Date.now();
         try {
           execution = await executeToolCall(opts, call);
         } finally {
           status.stop();
         }
+        execution.durationMs = Date.now() - startedAt;
       } else {
         execution = executions.shift();
       }
-      writeToolCall(opts, execution.name, execution.rawArgs);
+      toolTracker.complete(trackerIds.get(call.id), execution.durationMs, isToolError(execution.result));
       writeToolResult(opts, toolDisplayResult(execution.name, execution.args, execution.result), collectPathLikeValues(execution.args));
       session.messages.push({ role: "tool", tool_call_id: execution.call.id, content: String(execution.result) });
       session.touchedFiles = [...(opts.touchedFiles || [])];
       session.cache = { ...(opts.sessionCache || {}) };
       if (opts.saveSession) await writeSession(opts.session, touchSession(session));
     }
+    if (opts.agentWaitRequest) return;
+    await deliverPendingAgentMessages(opts, session);
   }
 
-  throw new Error(`Stopped after ${opts.maxToolTurns} tool turns (--max-tool-turns).`);
+  // A deliberate tool budget should still leave a valid handoff/result file.
+  // Make one tools-disabled completion request instead of throwing away all
+  // completed work and skipping maybeWriteOutput().
+  const finalizerOpts = { ...opts, thinking: "disabled", maxTokens: Math.max(2048, Math.min(opts.maxTokens, 8192)) };
+  const finalCompacted = await ensureContextCompact(opts, session);
+  if (finalCompacted && opts.saveSession) await writeSession(opts.session, touchSession(session));
+  session.messages.push({
+    role: "user",
+    content: `The configured tool-call budget (${opts.maxToolTurns}) has been reached. Do not call tools. Give the required final response now: summarize completed work, files touched, checks/evidence, and what remains unfinished because of the budget.`
+  });
+  const response = await streamChat(finalizerOpts, session.messages, false);
+  const { finishReason, ...assistant } = response;
+  session.messages.push(assistant);
+  session.tool_turn_limit = {
+    reached: true,
+    limit: opts.maxToolTurns,
+    finalized_at: nowIso(),
+    finish_reason: finishReason || null
+  };
+  if (opts.saveSession) await writeSession(opts.session, touchSession(session));
+  if (!opts.noOutput) heading(opts, `tool budget reached (${opts.maxToolTurns}); wrote final response without tools`, "warn");
+}
+
+async function deliverPendingAgentMessages(opts, session, messages = null) {
+  const pending = messages || await readAgentInbox(opts.coordDir, opts.agentId);
+  if (!pending.length) return false;
+  const deliveredIds = new Set(Array.isArray(session.agentMessageIds) ? session.agentMessageIds : []);
+  const fresh = pending.filter((message) => !deliveredIds.has(message.id));
+  const compactRequests = fresh.filter((message) => message.type === "compact");
+  const llmMessages = fresh.filter((message) => message.type !== "compact");
+
+  if (compactRequests.length) {
+    for (const request of compactRequests) {
+      let body = {};
+      try { body = JSON.parse(request.body || "{}"); } catch { body = {}; }
+      const method = body.method === "auto" ? "auto" : "truncate";
+      let meta = null;
+      try {
+        meta = await compactSession({ ...opts, compactMethod: method, compactForce: true }, session);
+        if (meta && opts.saveSession) await writeSession(opts.session, touchSession(session));
+      } catch (error) {
+        meta = { error: error.message };
+      }
+      try {
+        await sendAgentMessage(opts.coordDir, {
+          from: opts.agentId,
+          to: request.from,
+          type: "status",
+          body: JSON.stringify({ compacted: Boolean(meta && !meta.error), meta, requestedBy: body.requestedBy || null })
+        });
+      } catch { /* a failed status reply must not break the turn */ }
+    }
+    if (!opts.noOutput) heading(opts, `handled ${compactRequests.length} inbox compaction request(s)`, "session");
+  }
+
+  if (llmMessages.length) {
+    const parts = [`Messages delivered to agent ${opts.agentId} from the shared coordination inbox:`, ""];
+    if (compactRequests.length) {
+      parts.push(`Note: ${compactRequests.length} inbox compaction request(s) were handled automatically and are NOT listed below.`, "");
+    }
+    parts.push(formatAgentMessages(llmMessages), "", "Respond or act according to your current mission. Use agent_send for replies and agent_wait if you are ready to park again.");
+    session.messages.push({ role: "user", content: parts.join("\n") });
+    session.agentMessageIds = [...deliveredIds, ...fresh.map((message) => message.id)].slice(-5000);
+    if (opts.saveSession) await writeSession(opts.session, touchSession(session));
+  } else if (compactRequests.length) {
+    // Woken only to compact: give the agent a short prompt so the wake is useful.
+    session.messages.push({
+      role: "user",
+      content: "Session compacted automatically per an inbox request. Report the compaction result to the requester if relevant, then continue your mission or park again."
+    });
+    session.agentMessageIds = [...deliveredIds, ...fresh.map((message) => message.id)].slice(-5000);
+    if (opts.saveSession) await writeSession(opts.session, touchSession(session));
+  }
+  await acknowledgeAgentMessages(opts.coordDir, opts.agentId, pending);
+  return fresh.length > 0;
+}
+
+// While an agent is parked, let the operator type a wake message straight at
+// the terminal: the text is queued to the agent's own coordination inbox and
+// the wait poll delivers it, waking the session. No-op for headless/spawned
+// agents (no TTY) or when output is suppressed.
+function installParkedInputHandler(opts, agentId, onAbort) {
+  if (!opts.interactiveChat || !process.stdin.isTTY || typeof process.stdin.setRawMode !== "function" || opts.noOutput) {
+    return () => {};
+  }
+  const stdin = process.stdin;
+  let buffer = "";
+  stdin.resume();
+  stdin.setRawMode(true);
+  const prompt = () => {
+    if (!opts.noOutput) process.stdout.write(`  ${dim(opts, "[parked] type a wake message + Enter> ")}`);
+  };
+  prompt();
+  const onData = (chunk) => {
+    const text = chunk.toString("utf8");
+    for (const ch of text) {
+      if (ch === "\u0003") { // Ctrl+C: abort the wait (matches "Ctrl+C to exit")
+        buffer = "";
+        if (typeof onAbort === "function") onAbort();
+        return;
+      }
+      if (ch === "\r" || ch === "\n") {
+        const line = buffer.trim();
+        buffer = "";
+        if (line) {
+          void sendAgentMessage(opts.coordDir, { from: "operator", to: agentId, body: line, type: "message" })
+            .then(() => { if (!opts.noOutput) process.stdout.write(`  ${green(opts, "✓ wake message queued - agent will resume")}\n`); })
+            .catch((error) => { if (!opts.noOutput) process.stdout.write(`  ${red(opts, `✗ ${error.message}`)}\n`); });
+        } else if (!opts.noOutput) {
+          process.stdout.write("\n");
+        }
+        prompt();
+        return;
+      }
+      if (ch === "\u007f" || ch === "\b") { // backspace
+        if (buffer.length) {
+          buffer = buffer.slice(0, -1);
+          if (!opts.noOutput) process.stdout.write("\b \b");
+        }
+        continue;
+      }
+      if (ch >= " " && ch !== "\u001b") { // printable chars (Esc and arrows ignored)
+        buffer += ch;
+        if (!opts.noOutput) process.stdout.write(ch);
+      }
+    }
+  };
+  stdin.on("data", onData);
+  return () => {
+    stdin.off("data", onData);
+    try { stdin.setRawMode(false); } catch {}
+    stdin.resume();
+  };
+}
+
+async function waitForCoordinatedMessage(opts, session, request) {
+  await activeAgentRuntime(opts).setState("waiting_for_message", {
+    waitReason: request.reason,
+    waitStartedAt: nowIso(),
+    waitTimeoutMs: request.timeoutMs || 0
+  });
+  if (!opts.noOutput) heading(opts, `agent ${opts.agentId} parked: ${request.reason}`, "session");
+  const controller = new AbortController();
+  const interrupt = () => controller.abort(new Error("Agent wait interrupted."));
+  process.once("SIGINT", interrupt);
+  const cleanupInput = installParkedInputHandler(opts, opts.agentId, interrupt);
+  try {
+    const result = await waitForAgentMessages(opts.coordDir, opts.agentId, {
+      timeoutMs: request.timeoutMs,
+      pollMs: 500,
+      signal: controller.signal
+    });
+    if (result.timedOut) {
+      session.messages.push({
+        role: "user",
+        content: `<agent_wait_timeout agent=${JSON.stringify(opts.agentId)} waited_ms=${JSON.stringify(request.timeoutMs)}>\nNo agent message arrived before the requested wait timeout. Reassess your mission, report status if useful, and either continue or call agent_wait again.\n</agent_wait_timeout>`
+      });
+      if (opts.saveSession) await writeSession(opts.session, touchSession(session));
+    } else {
+      await deliverPendingAgentMessages(opts, session, result.messages);
+    }
+  } finally {
+    cleanupInput();
+    process.removeListener("SIGINT", interrupt);
+    await activeAgentRuntime(opts).setState("working", {
+      waitReason: null,
+      waitStartedAt: null,
+      waitTimeoutMs: 0
+    });
+  }
+}
+
+async function runCoordinatedAgent(opts, session) {
+  await activeAgentRuntime(opts).setState("working");
+  while (true) {
+    await deliverPendingAgentMessages(opts, session);
+    opts.agentWaitRequest = null;
+    await processAgentTurns(opts, session);
+    if (opts.agentWaitRequest) {
+      await waitForCoordinatedMessage(opts, session, opts.agentWaitRequest);
+      continue;
+    }
+    if (await deliverPendingAgentMessages(opts, session)) continue;
+    return;
+  }
 }
 
 function isExitCommand(text) {
@@ -3480,6 +4898,150 @@ function launchElectronUi(argv) {
   });
 }
 
+function parseCoordinationCommandArgs(argv) {
+  const opts = { coordDir: null, from: "operator", all: false, json: false, interactive: false, type: null, taskId: null, positional: [] };
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    const next = () => {
+      i += 1;
+      if (i >= argv.length) throw new Error(`Missing value for ${arg}`);
+      return argv[i];
+    };
+    if (arg === "--coord-dir") opts.coordDir = next();
+    else if (arg === "--from") opts.from = next();
+    else if (arg === "--type") opts.type = next();
+    else if (arg === "--task" || arg === "--task-id") opts.taskId = next();
+    else if (arg === "--all") opts.all = true;
+    else if (arg === "--json") opts.json = true;
+    else if (arg === "-i" || arg === "--interactive") opts.interactive = true;
+    else if (arg.startsWith("--")) throw new Error(`Unknown coordination option: ${arg}`);
+    else opts.positional.push(arg);
+  }
+  opts.coordDir = coordinationRoot(opts.coordDir);
+  return opts;
+}
+
+function formatAgentRows(agents) {
+  if (!agents.length) return "No matching agents registered in this coordination directory.";
+  return agents.map((agent) => [
+    agent.agentId,
+    `[${agent.live ? "live" : agent.state || "unknown"}]`,
+    `pid=${agent.pid}`,
+    `role=${agent.role || "worker"}`,
+    `workspace=${agent.workspace}`,
+    `mission=${agent.mission || "(not assigned)"}`
+  ].join("  ")).join("\n");
+}
+
+async function agentPanel(opts) {
+  if (!process.stdin.isTTY) {
+    process.stdout.write("Interactive agent panel requires a TTY. Use `d agents` for a plain listing, or `d message <agent-id> <text>` to send.\n");
+    return;
+  }
+  // Register the terminal as the "cli" operator agent so agents can reply to
+  // the panel (replies land in inbox/cli). Tolerates an already-active record
+  // (another terminal panel attached to the same board).
+  const FROM = "cli";
+  let runtime = null;
+  try {
+    runtime = await createAgentRuntime(opts.coordDir, {
+      agentId: FROM,
+      role: "operator",
+      state: "working",
+      mission: "Terminal agent panel - messages sent here wake parked agents; replies land in this inbox.",
+      workspace: process.cwd(),
+      heartbeatMs: 30000
+    });
+  } catch (error) {
+    if (!String(error && error.message).includes("already active")) throw error;
+  }
+  try {
+    for (;;) {
+      const agents = await listAgents(opts.coordDir, { includeStopped: true });
+      const visible = agents.filter((agent) => agent.agentId !== FROM);
+      process.stdout.write(`\n  ${bold(opts, "Agents")}  ${dim(opts, opts.coordDir)}\n`);
+      if (!visible.length) {
+        process.stdout.write(`  ${dim(opts, "No agents registered in this coordination directory.")}\n`);
+        const wait = (await promptLine("  q to quit: ")).trim().toLowerCase();
+        if (wait === "q" || wait === "") break;
+        continue;
+      }
+      visible.forEach((agent, i) => {
+        const badge = !agent.live
+          ? red(opts, "stopped")
+          : agent.state === "waiting_for_message"
+            ? yellow(opts, "parked")
+            : green(opts, agent.state || "working");
+        const mission = String(agent.mission || "").replace(/\s+/g, " ").slice(0, 52);
+        process.stdout.write(`  ${dim(opts, `${String(i + 1).padStart(2, " ")}.`)} ${agent.agentId} ${badge}${mission ? ` ${dim(opts, mission)}` : ""}\n`);
+      });
+      process.stdout.write(`  ${dim(opts, "Number = message agent (wakes parked) · r = replies · q = quit")}\n`);
+      const choice = (await promptLine("  > ")).trim().toLowerCase();
+      if (choice === "" || choice === "q") break;
+      if (choice === "r") {
+        const replies = (await readAgentInbox(opts.coordDir, FROM)).filter((message) => message.from && message.from !== FROM);
+        process.stdout.write(`\n  ${bold(opts, `Replies from agents (${replies.length})`)}\n`);
+        if (!replies.length) process.stdout.write(`  ${dim(opts, "No replies yet.")}\n`);
+        for (const reply of replies.slice(-5)) {
+          process.stdout.write(`  ${dim(opts, reply.from)} ${reply.createdAt ? new Date(reply.createdAt).toLocaleTimeString() : ""}: ${String(reply.body).slice(0, 130)}\n`);
+        }
+        continue;
+      }
+      const n = Number.parseInt(choice, 10);
+      const agent = visible[n - 1];
+      if (!agent) {
+        process.stdout.write(`  ${red(opts, "Invalid choice.")}\n`);
+        continue;
+      }
+      const body = (await promptLine(`  Message to ${agent.agentId}> `)).trim();
+      if (!body) continue;
+      const message = await sendAgentMessage(opts.coordDir, { from: FROM, to: agent.agentId, body, type: "message" });
+      process.stdout.write(`  ${green(opts, "✓ sent")} ${message.id.slice(0, 8)} -> ${agent.agentId}${agent.state === "waiting_for_message" ? ` ${yellow(opts, "(parked — wakes on next poll)")}` : ""}\n`);
+    }
+  } finally {
+    try { if (runtime) await runtime.stop("stopped"); } catch { /* best effort */ }
+  }
+}
+
+async function runCoordinationCommand(command, argv) {
+  const opts = parseCoordinationCommandArgs(argv);
+  if (command === "agents") {
+    if (opts.interactive) {
+      await agentPanel(opts);
+      return;
+    }
+    const agents = await listAgents(opts.coordDir, { includeStopped: opts.all });
+    process.stdout.write(`${opts.json ? JSON.stringify(agents, null, 2) : formatAgentRows(agents)}\n`);
+    return;
+  }
+  if (command === "message" || command === "wake") {
+    const [to, ...bodyParts] = opts.positional;
+    if (!to) throw new Error(`Usage: d ${command} <agent-id> ${command === "message" ? "<message>" : "[message]"} [--from <agent-id>] [--coord-dir <dir>]`);
+    const body = bodyParts.join(" ").trim() || "Wake up, inspect your coordination inbox and current mission, then continue safely.";
+    const message = await sendAgentMessage(opts.coordDir, {
+      from: opts.from,
+      to,
+      body,
+      type: command === "wake" ? "wake" : (opts.type || "message"),
+      taskId: opts.taskId
+    });
+    process.stdout.write(`Queued ${message.type} ${message.id} from ${message.from} to ${message.to}.\n`);
+    return;
+  }
+  if (command === "inbox") {
+    const [agentId] = opts.positional;
+    if (!agentId) throw new Error("Usage: d inbox <agent-id> [--coord-dir <dir>]");
+    const messages = await readAgentInbox(opts.coordDir, agentId);
+    process.stdout.write(`${JSON.stringify(messages, null, 2)}\n`);
+    return;
+  }
+  if (command === "tasks") {
+    process.stdout.write(`${JSON.stringify(await listTasks(opts.coordDir), null, 2)}\n`);
+    return;
+  }
+  throw new Error(`Unknown coordination command: ${command}`);
+}
+
 async function run() {
   const argv = process.argv.slice(2);
   if (argv[0] === "-ui" || argv[0] === "--ui" || argv[0] === "ui") {
@@ -3488,6 +5050,56 @@ async function run() {
   }
   if (argv[0] === "doctor") {
     process.stdout.write(`${await doctor()}\n`);
+    return;
+  }
+  if (argv[0] === "skill") {
+    try {
+      await runSkillCommand(argv.slice(1));
+    } catch (error) {
+      process.stderr.write(`${error.message}\n`);
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (["agents", "message", "wake", "inbox", "tasks"].includes(argv[0])) {
+    await runCoordinationCommand(argv[0], argv.slice(1));
+    return;
+  }
+
+  if (argv[0] === "security") {
+    const { allowlistPath, loadAllowlist } = await import("./security_tools.js");
+    const { mkdir, writeFile } = await import("node:fs/promises");
+    const { dirname } = await import("node:path");
+    const command = argv[1];
+    const domain = String(argv[2] || "").toLowerCase().trim();
+    const list = await loadAllowlist();
+    if (command === "allow") {
+      if (!domain || !/^[a-z0-9.-]+\.[a-z]{2,}$/.test(domain)) {
+        process.stdout.write("Usage: dsw security allow <domain>  (e.g. dsw security allow example.com)\n");
+        return;
+      }
+      if (!list.domains.includes(domain)) {
+        list.domains.push(domain);
+        await mkdir(dirname(allowlistPath()), { recursive: true });
+        await writeFile(allowlistPath(), JSON.stringify(list, null, 2), "utf8");
+      }
+      process.stdout.write(`Allowlisted: ${list.domains.join(", ") || "(none)"}\n`);
+      return;
+    }
+    if (command === "remove") {
+      list.domains = list.domains.filter((d) => d !== domain);
+      await mkdir(dirname(allowlistPath()), { recursive: true });
+      await writeFile(allowlistPath(), JSON.stringify(list, null, 2), "utf8");
+      process.stdout.write(`Allowlisted: ${list.domains.join(", ") || "(none)"}\n`);
+      return;
+    }
+    if (command === "list" || !command) {
+      process.stdout.write(
+        `Security allowlist (${allowlistPath()}):\n${list.domains.length ? list.domains.map((d) => `  - ${d}`).join("\n") : "  (empty — no targets allowed yet)"}\n`
+      );
+      return;
+    }
+    process.stdout.write("Usage: dsw security allow <domain> | dsw security remove <domain> | dsw security list\n");
     return;
   }
 
@@ -3521,6 +5133,11 @@ async function run() {
   if (opts.quit) return;
   validateOpts(opts);
 
+  if (opts.interactiveChat && !opts.quit && process.stdout.isTTY) {
+    const cwdName = String(process.cwd()).split(/[\\/]/).filter(Boolean).pop() || "workspace";
+    setTerminalTitle(`dsw · ${cwdName}`);
+  }
+
   if (opts.help) {
     process.stdout.write(usage());
     return;
@@ -3532,10 +5149,38 @@ async function run() {
   }
 
   let resumedSession = null;
+  let autoAgentSession = false;
   if (!opts.session && opts.resume) {
-    opts.session = await pickSession(opts);
+    const picked = await pickSession(opts);
+    opts.session = picked.path;
+    if (picked.agentId && !opts.agentId) opts.agentId = picked.agentId;
   }
-  if (opts.resume) {
+  // Tie a stable agent id to a single session file: reuse the agent's most
+  // recent session instead of scattering one session per launch. Pass --new
+  // to start a fresh session for the agent id.
+  if (!opts.session && !opts.newSession && opts.agentId) {
+    const agentSession = await findSessionForAgent(validateAgentId(opts.agentId));
+    if (agentSession) {
+      opts.session = agentSession;
+      autoAgentSession = true;
+    }
+  }
+  // The coordination record stores the agent's definitive absolute session
+  // path — use it when the workspace-relative session list misses (e.g. the
+  // shim is run from a different cwd).
+  if (!opts.session && !opts.newSession && opts.agentId) {
+    try {
+      const root = coordinationRoot(opts.coordDir);
+      await stat(join(root, "agents"));
+      const record = JSON.parse(await readFile(join(root, "agents", `${validateAgentId(opts.agentId)}.json`), "utf8"));
+      if (record.session) {
+        await stat(record.session);
+        opts.session = record.session;
+        autoAgentSession = true;
+      }
+    } catch {}
+  }
+  if (opts.resume || autoAgentSession) {
     resumedSession = await readSession(opts.session);
     if (!opts.skills.length && Array.isArray(resumedSession.config?.skills)) {
       opts.skills = normalizeList(resumedSession.config.skills);
@@ -3544,6 +5189,11 @@ async function run() {
       opts.skillRoots = normalizeList(resumedSession.config.skillRoots);
     }
   }
+
+  opts.agentRole = String(opts.agentRole || resumedSession?.config?.agentRole || "worker").trim().toLowerCase() || "worker";
+  opts.agentMission = String(opts.agentMission || resumedSession?.config?.agentMission || "").trim();
+  opts.agentId = validateAgentId(opts.agentId || resumedSession?.config?.agentId || generateAgentId(opts.agentRole));
+  opts.coordDir = coordinationRoot(opts.coordDir || resumedSession?.config?.coordDir);
 
   opts.skills = normalizeList(opts.skills);
   opts.skillRoots = normalizeList(opts.skillRoots);
@@ -3559,7 +5209,7 @@ async function run() {
     opts.session = newSessionPath();
   }
 
-  const session = opts.resume
+  const session = (opts.resume || autoAgentSession)
     ? resumedSession
     : newSession({
       model: opts.model,
@@ -3575,7 +5225,7 @@ async function run() {
       }
     });
 
-  if (opts.resume && (opts.skills.length || opts.skillRoots.length)) {
+  if (opts.resume || autoAgentSession) {
     updateSystemMessage(session, systemPrompt);
   }
 
@@ -3595,40 +5245,55 @@ async function run() {
     permission: opts.permission,
     toolMode: opts.toolMode,
     skills: opts.skills,
-    skillRoots: opts.skillRoots
+    skillRoots: opts.skillRoots,
+    agentId: opts.agentId,
+    agentRole: opts.agentRole,
+    agentMission: opts.agentMission,
+    coordDir: opts.coordDir
   };
   opts.touchedFiles = new Set(session.touchedFiles || []);
   opts.sessionCache = { ...(session.cache || {}) };
   opts.sessionObject = session;
+  opts.agentRuntime = await createAgentRuntime(opts.coordDir, {
+    agentId: opts.agentId,
+    role: opts.agentRole,
+    mission: opts.agentMission,
+    workspace: process.cwd(),
+    session: opts.session
+  });
+  if (!opts.noOutput) process.stderr.write(`Agent: ${opts.agentId} (${opts.agentRole})\nCoordination: ${opts.coordDir}\n`);
 
-  if (opts.resume) {
+  if (opts.resume || autoAgentSession) {
     session.messages.push({ role: "user", content: userPrompt });
   }
 
-  if (opts.saveSession) {
-    await writeSession(opts.session, touchSession(session));
-    writeSessionNotice(opts, sessionPath(opts.session));
-  }
-
-  await processAgentTurns(opts, session);
-  session.touchedFiles = [...opts.touchedFiles];
-  session.cache = { ...(opts.sessionCache || {}) };
-  if (opts.saveSession) await writeSession(opts.session, touchSession(session));
-  await maybeWriteOutput(opts, session);
-
-  while (opts.interactiveChat) {
-    const contextTokens = formatCompactCount(estimateContextTokens(session.messages));
-    process.stdout.write(`\n  ${dim(opts, `Enter to send, /exit to quit, Ctrl+C to exit · context ${contextTokens} tokens`)}\n`);
-    const nextPrompt = await promptLine("  > ");
-    if (!nextPrompt.trim()) continue;
-    if (isExitCommand(nextPrompt)) return;
-    session.messages.push({ role: "user", content: nextPrompt });
+  try {
     if (opts.saveSession) await writeSession(opts.session, touchSession(session));
-    await processAgentTurns(opts, session);
+    if (opts.saveSession) writeSessionNotice(opts, sessionPath(opts.session));
+    await runCoordinatedAgent(opts, session);
     session.touchedFiles = [...opts.touchedFiles];
     session.cache = { ...(opts.sessionCache || {}) };
     if (opts.saveSession) await writeSession(opts.session, touchSession(session));
     await maybeWriteOutput(opts, session);
+
+    while (opts.interactiveChat) {
+      const contextTokens = formatCompactCount(estimateContextTokens(session.messages));
+      process.stdout.write(`\n  ${dim(opts, `Enter to send, /exit to quit, Ctrl+C to exit · context ${contextTokens} tokens`)}\n`);
+      const nextPrompt = await promptLine("  > ");
+      if (!nextPrompt.trim()) continue;
+      if (isExitCommand(nextPrompt)) break;
+      session.messages.push({ role: "user", content: nextPrompt });
+      if (opts.saveSession) await writeSession(opts.session, touchSession(session));
+      await runCoordinatedAgent(opts, session);
+      session.touchedFiles = [...opts.touchedFiles];
+      session.cache = { ...(opts.sessionCache || {}) };
+      if (opts.saveSession) await writeSession(opts.session, touchSession(session));
+      await maybeWriteOutput(opts, session);
+    }
+    await opts.agentRuntime.stop("completed");
+  } catch (error) {
+    await opts.agentRuntime.stop("failed", { error: error.message });
+    throw error;
   }
 }
 

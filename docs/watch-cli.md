@@ -167,3 +167,48 @@ Print the rendered system prompt:
 ```powershell
 deepseek-watch --print-system
 ```
+
+## Agent sessions
+
+When you pass `--agent-id <id>`, the CLI ties that id to a single session file
+instead of scattering one session per launch:
+
+- The first launch with `--agent-id X` creates a session (in
+  `.deepseek-watch/sessions/`) and records `config.agentId = X` in it.
+- Later launches with `--agent-id X` automatically resume the agent's most
+  recently updated session (matched by the saved `agentId`) and append the new
+  prompt, so the agent keeps its memory across launches.
+- Pass `--new` to start a fresh session for that agent id anyway.
+
+An explicit `--session <file>` always wins over the lookup, and `--resume`
+keeps its existing meaning. `--resume` and `--new` are mutually exclusive.
+
+Example:
+
+```powershell
+deepseek-watch --agent-id worker-1 -p "Continue your assigned work."
+deepseek-watch --agent-id worker-1 --new -p "Start over with a clean session."
+```
+
+## Fetch retries
+
+The CLI retries transient fetch failures instead of crashing:
+
+- Network blips (`ECONNRESET`, `ECONNREFUSED`, DNS failures, undici errors)
+- Per-turn timeouts (`--timeout`, default 600000 ms)
+- HTTP 408/425/429 (rate limits) and 5xx responses
+
+Auth/config errors (400/401/402/403/404) are terminal and still fail fast with
+a clean one-line message. Esc/Ctrl+C during a turn still marks it interrupted
+and stops the retry loop.
+
+Retry backoff doubles per attempt:
+
+```text
+--retry-attempts <number>    Max retries. 0 (default) = keep retrying forever.
+--retry-delay <ms>           Initial backoff. Default: 1000
+--retry-max-delay <ms>       Backoff cap. Default: 30000
+```
+
+The detached worker (`dsd`) uses the same retry policy and passes these flags
+through `--detach`.

@@ -12,9 +12,45 @@ const controlPort = Number.parseInt(process.env.DEEPSEEK_UI_PORT || "17891", 10)
 const cdpPort = Number.parseInt(process.env.DEEPSEEK_UI_CDP_PORT || "9223", 10);
 const runs = new Map();
 const sessionDir = resolve(workspace, ".deepseek-watch", "sessions");
+const coordRoot = resolve(process.env.DEEPSEEK_UI_COORD_DIR || join(workspace, ".deepseek-watch", "coordination"));
+
+// agent-coordination.js is ESM; load it lazily from CJS via dynamic import.
+function coordinationApi() {
+  return import("../agent-coordination.js");
+}
+
+function coordinationError(error) {
+  return { error: error && error.message ? error.message : String(error) };
+}
 
 let mainWindow = null;
 let server = null;
+let uiRuntime = null;
+
+async function registerUiAgent() {
+  try {
+    const api = await coordinationApi();
+    uiRuntime = await api.createAgentRuntime(coordRoot, {
+      agentId: "ui",
+      role: "operator",
+      state: "working",
+      mission: "Operator desktop UI - send messages here to wake agents; replies land in this inbox.",
+      workspace,
+      heartbeatMs: 30000
+    });
+    return true;
+  } catch (error) {
+    if (String(error && error.message).includes("already active")) return true; // another TUI instance is attached
+    console.error("[ui] could not register agent 'ui':", error && error.message ? error.message : error);
+    return false;
+  }
+}
+
+async function unregisterUiAgent() {
+  try {
+    if (uiRuntime) await uiRuntime.stop("stopped");
+  } catch { /* best effort */ }
+}
 
 function json(res, status, body) {
   const text = JSON.stringify(body, null, 2);
@@ -292,6 +328,33 @@ function startControlServer() {
       if (req.method === "GET" && url.pathname === "/runs") {
         return json(res, 200, Array.from(runs.values()).map(safeRun));
       }
+      if (req.method === "GET" && url.pathname === "/agents") {
+        const api = await coordinationApi();
+        return json(res, 200, await api.listAgents(coordRoot, { includeStopped: true }));
+      }
+      if (req.method === "GET" && url.pathname === "/agents/live") {
+        const api = await coordinationApi();
+        return json(res, 200, await api.listAgents(coordRoot, { includeStopped: false }));
+      }
+      const inboxMatch = url.pathname.match(/^\/agents\/([^/]+)\/inbox$/);
+      if (req.method === "GET" && inboxMatch) {
+        const api = await coordinationApi();
+        return json(res, 200, await api.readAgentInbox(coordRoot, decodeURIComponent(inboxMatch[1])));
+      }
+      if (req.method === "POST" && url.pathname === "/agents/send") {
+        const api = await coordinationApi();
+        const body = await readRequestJson(req);
+        const message = await api.sendAgentMessage(coordRoot, {
+          from: String(body.from || "ui"),
+          to: body.to,
+          body: body.body,
+          type: body.type || "message",
+          priority: body.priority || "normal",
+          taskId: body.taskId,
+          replyTo: body.replyTo
+        });
+        return json(res, 201, message);
+      }
       return json(res, 404, { error: "not found" });
     } catch (error) {
       return json(res, 500, { error: error.message });
@@ -316,18 +379,53 @@ function createWindow() {
   mainWindow.loadFile(join(__dirname, "index.html"));
 }
 
-ipcMain.handle("app:info", () => ({ workspace, controlPort, cdpPort }));
+ipcMain.handle("app:info", () => ({ workspace, controlPort, cdpPort, coordRoot }));
 ipcMain.handle("runs:list", () => Array.from(runs.values()).map(safeRun));
 ipcMain.handle("chat:start", async (_event, input) => safeRun(await startRun(input || {})));
 ipcMain.handle("sessions:list", () => listSessionSummaries());
 ipcMain.handle("sessions:read", (_event, path) => safeSession(path));
+ipcMain.handle("agents:list", async (_event, options) => {
+  try {
+    const api = await coordinationApi();
+    return { ok: true, agents: await api.listAgents(coordRoot, { includeStopped: Boolean(options?.includeStopped) }) };
+  } catch (error) {
+    return { ok: false, ...coordinationError(error) };
+  }
+});
+ipcMain.handle("agents:send", async (_event, input) => {
+  try {
+    const api = await coordinationApi();
+    const message = await api.sendAgentMessage(coordRoot, {
+      from: String(input?.from || "ui"),
+      to: input?.to,
+      body: input?.body,
+      type: input?.type || "message",
+      priority: input?.priority || "normal",
+      taskId: input?.taskId,
+      replyTo: input?.replyTo
+    });
+    return { ok: true, message };
+  } catch (error) {
+    return { ok: false, ...coordinationError(error) };
+  }
+});
+ipcMain.handle("agents:inbox", async (_event, agentId) => {
+  try {
+    const api = await coordinationApi();
+    return { ok: true, messages: await api.readAgentInbox(coordRoot, String(agentId || "ui"), { max: 50 }) };
+  } catch (error) {
+    return { ok: false, ...coordinationError(error) };
+  }
+});
 
 app.whenReady().then(() => {
   startControlServer();
+  registerUiAgent();
   createWindow();
 });
 
 app.on("window-all-closed", () => {
   if (server) server.close();
+  unregisterUiAgent();
   if (process.platform !== "darwin") app.quit();
 });

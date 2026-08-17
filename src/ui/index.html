@@ -126,12 +126,106 @@
       align-items: end;
     }
 
-    .sessions, .runs {
+    .sessions, .runs, .agents {
       display: grid;
       gap: 8px;
       overflow: auto;
       padding-right: 2px;
       min-height: 0;
+    }
+
+    .agent {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 10px;
+      display: grid;
+      gap: 8px;
+    }
+
+    .agent-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .agent-meta {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.45;
+      word-break: break-word;
+    }
+
+    .badge {
+      border-radius: 999px;
+      padding: 3px 8px;
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      border: 1px solid transparent;
+    }
+
+    .badge.parked { color: var(--warn); border-color: #6b5a26; background: #241f10; }
+    .badge.working { color: var(--ok); border-color: #2d684a; background: #12241b; }
+    .badge.stopped { color: var(--bad); border-color: #6b2a2a; background: #241212; }
+
+    .agent-compose {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 6px;
+    }
+
+    .agent-compose input {
+      height: 30px;
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 0 9px;
+      font: 12px ui-monospace, Consolas, monospace;
+      outline: none;
+    }
+
+    .agent-compose input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(71, 194, 255, 0.18);
+    }
+
+    .agent-compose button {
+      height: 30px;
+      padding: 0 10px;
+      font-size: 12px;
+      border-radius: 6px;
+      white-space: nowrap;
+    }
+
+    .agent-feedback {
+      color: var(--ok);
+      font-size: 11px;
+    }
+
+    .agent-feedback.error { color: var(--bad); }
+
+    .agent-inbox {
+      margin-top: 2px;
+      border-top: 1px dashed var(--line);
+      padding-top: 6px;
+      display: grid;
+      gap: 4px;
+      max-height: 96px;
+      overflow: auto;
+    }
+
+    .agent-inbox .inbox-item {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.4;
+      word-break: break-word;
     }
 
     .session, .run {
@@ -341,6 +435,12 @@
         <h2>Runs</h2>
         <div class="runs" id="runs"></div>
       </section>
+
+      <section>
+        <h2>Agents <span class="meta" style="font-weight:400;text-transform:none">— send wakes parked</span></h2>
+        <div class="agents" id="agents"></div>
+        <div id="ui-replies"></div>
+      </section>
     </aside>
 
     <main>
@@ -383,6 +483,8 @@
     const sendEl = document.querySelector("#send");
     const sessionsEl = document.querySelector("#sessions");
     const runsEl = document.querySelector("#runs");
+    const agentsEl = document.querySelector("#agents");
+    const uiRepliesEl = document.querySelector("#ui-replies");
     const historyEl = document.querySelector("#history");
     const filesEl = document.querySelector("#files");
     const stdoutEl = document.querySelector("#stdout");
@@ -394,6 +496,7 @@
 
     let runs = [];
     let sessions = [];
+    let agents = [];
     let selectedRunId = null;
     let selectedSessionPath = "";
     let currentSession = null;
@@ -551,9 +654,105 @@
       stderrEl.textContent = run?.stderrTail || "";
     }
 
+    function agentBadge(agent) {
+      if (!agent.live) return '<span class="badge stopped">stopped</span>';
+      if (agent.state === "waiting_for_message") return '<span class="badge parked">parked</span>';
+      return '<span class="badge working">' + escapeHtml(agent.state || "working") + "</span>";
+    }
+
+    async function sendToAgent(agentId, inputEl, feedbackEl, type) {
+      const body = inputEl.value.trim();
+      if (!body) {
+        feedbackEl.textContent = "Type a message first.";
+        feedbackEl.className = "agent-feedback error";
+        return;
+      }
+      feedbackEl.textContent = "sending…";
+      feedbackEl.className = "agent-feedback";
+      const result = await window.deepseekUi.sendAgentMessage({
+        to: agentId,
+        body,
+        type: type || "message"
+      });
+      if (result && result.ok) {
+        inputEl.value = "";
+        feedbackEl.textContent = type === "status_request"
+          ? "sent · agent will report status"
+          : "sent · agent woken if parked";
+        feedbackEl.className = "agent-feedback";
+      } else {
+        feedbackEl.textContent = (result && result.error) || "send failed";
+        feedbackEl.className = "agent-feedback error";
+      }
+    }
+
+    async function refreshUiReplies() {
+      const result = await window.deepseekUi.listAgentInbox("ui");
+      if (!result || !result.ok || !uiRepliesEl) return;
+      const replies = (result.messages || []).filter((message) => message.from && message.from !== "ui");
+      if (!replies.length) {
+        uiRepliesEl.innerHTML = "";
+        return;
+      }
+      uiRepliesEl.innerHTML = `<div class="meta" style="margin-top:8px"><b>Replies from agents</b></div>` +
+        replies.slice(-4).reverse().map((message) =>
+          `<div class="inbox-item" style="margin-top:4px"><b>${escapeHtml(message.from)}</b> · ${new Date(message.createdAt).toLocaleTimeString()}: ${escapeHtml(String(message.body).slice(0, 140))}</div>`
+        ).join("");
+    }
+
+    function renderAgents() {
+      agentsEl.innerHTML = "";
+      const visible = agents.filter((agent) => agent.agentId !== "ui");
+      if (!visible.length) {
+        agentsEl.innerHTML = '<div class="meta">No coordination agents found.</div>';
+        return;
+      }
+      for (const agent of visible) {
+        const card = document.createElement("div");
+        card.className = "agent";
+        const mission = String(agent.mission || agent.session || "").trim();
+        card.innerHTML = `
+          <div class="agent-row">
+            <span>${escapeHtml(agent.agentId)}</span>
+            ${agentBadge(agent)}
+          </div>
+          <div class="agent-meta">${escapeHtml(agent.role || "worker")}${mission ? ` · ${escapeHtml(mission.slice(0, 60))}` : ""}</div>
+          <div class="agent-compose">
+            <input type="text" placeholder="Message (wakes parked agents)" spellcheck="false">
+            <button>Send</button>
+          </div>
+        `;
+        const input = card.querySelector("input");
+        const button = card.querySelector("button");
+        const feedback = document.createElement("div");
+        feedback.className = "agent-feedback";
+        card.appendChild(feedback);
+        input.addEventListener("keydown", (event) => {
+          if (event.key === "Enter") sendToAgent(agent.agentId, input, feedback, "message");
+        });
+        button.addEventListener("click", () => sendToAgent(agent.agentId, input, feedback, "message"));
+        agentsEl.appendChild(card);
+      }
+      refreshUiReplies();
+    }
+
+    async function refreshAgents() {
+      const result = await window.deepseekUi.listAgents({ includeStopped: true });
+      if (!result || !result.ok) {
+        agentsEl.innerHTML = `<div class="meta">${escapeHtml((result && result.error) || "Cannot reach coordination.")}</div>`;
+        return;
+      }
+      const previous = new Set(agents.map((agent) => agent.agentId));
+      agents = result.agents || [];
+      const added = agents.some((agent) => !previous.has(agent.agentId));
+      renderAgents();
+      if (added) render();
+    }
+
     function render() {
       renderSessions();
       renderRuns();
+      renderAgents();
       renderSelected();
     }
 
@@ -596,6 +795,8 @@
       render();
     });
     refreshSessions();
+    refreshAgents();
+    setInterval(refreshAgents, 5000);
     window.deepseekUi.onRuns((next) => {
       runs = next;
       render();

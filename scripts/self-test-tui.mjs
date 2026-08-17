@@ -1,0 +1,212 @@
+// Self-test for src/tui.js rendering logic (markdown writer, status line
+// helpers, tool tracker). Pure-logic checks; no real TTY required.
+import assert from "node:assert";
+import { createMarkdownWriter, formatDuration, renderMarkdownLine, ToolCallTracker } from "../src/tui.js";
+
+let passed = 0;
+function check(name, fn) {
+  fn();
+  passed += 1;
+  console.log(`  PASS ${name}`);
+}
+
+const colorOn = { color: true, model: "test-model" };
+const colorOff = { color: false };
+
+// formatDuration
+check("formatDuration", () => {
+  assert.equal(formatDuration(500), "500ms");
+  assert.equal(formatDuration(1500), "1.5s");
+  assert.equal(formatDuration(90000), "1m 30s");
+  assert.equal(formatDuration(0), "0ms");
+});
+
+// renderMarkdownLine: color-off is a plain passthrough.
+check("color-off passthrough", () => {
+  const line = "# Hello **world** `code`";
+  assert.equal(renderMarkdownLine(colorOff, line), line);
+});
+
+// renderMarkdownLine: block + inline styles produce ANSI codes.
+check("heading + inline styling", () => {
+  const out = renderMarkdownLine(colorOn, "## Hello **world** `code`");
+  assert.ok(out.includes("\x1b[1;36m"), "heading color");
+  assert.ok(out.includes("\x1b[1m"), "bold");
+  assert.ok(out.includes("\x1b[36m"), "inline code color");
+});
+
+check("bullet / task / numbered / quote", () => {
+  assert.ok(renderMarkdownLine(colorOn, "- item").includes("•"));
+  assert.ok(renderMarkdownLine(colorOn, "- [x] done").includes("[✓]"));
+  assert.ok(renderMarkdownLine(colorOn, "- [ ] todo").includes("[ ]"));
+  assert.ok(renderMarkdownLine(colorOn, "1. first").includes("1."));
+  assert.ok(renderMarkdownLine(colorOn, "> quoted").includes("│"));
+});
+
+check("fence state threading", () => {
+  let inFence = false;
+  let lang = "";
+  const state = { inFence: () => inFence, setFence: (v, l) => { inFence = v; lang = l; } };
+  const open = renderMarkdownLine(colorOn, "```js", state);
+  assert.equal(inFence, true);
+  assert.equal(lang, "js");
+  assert.ok(open.includes("js"));
+  const body = renderMarkdownLine(colorOn, "const x = 1;", state);
+  assert.ok(body.includes("\x1b[2m"), "fence body dimmed");
+  const close = renderMarkdownLine(colorOn, "```", state);
+  assert.equal(inFence, false);
+  assert.ok(close);
+});
+
+// Streaming writer: partial lines buffered until newline.
+check("writer buffers partial lines", () => {
+  const chunks = [];
+  const orig = process.stdout.write;
+  process.stdout.write = (s) => { chunks.push(s); return true; };
+  try {
+    const w = createMarkdownWriter(colorOff);
+    w.write("line1");
+    assert.equal(chunks.length, 0, "nothing flushed before newline");
+    w.write("\nline2\n");
+    assert.equal(chunks.length, 2);
+    assert.equal(chunks[0], "line1\n");
+    assert.equal(chunks[1], "line2\n");
+    w.flush();
+    assert.equal(chunks.length, 2, "flush with empty pending does nothing");
+  } finally {
+    process.stdout.write = orig;
+  }
+});
+
+check("writer flush emits trailing partial line", () => {
+  const chunks = [];
+  const orig = process.stdout.write;
+  process.stdout.write = (s) => { chunks.push(s); return true; };
+  try {
+    const w = createMarkdownWriter(colorOff);
+    w.write("tail");
+    w.flush();
+    assert.deepEqual(chunks, ["tail\n"]);
+  } finally {
+    process.stdout.write = orig;
+  }
+});
+
+check("writer can dim streamed reasoning body", () => {
+  const chunks = [];
+  const orig = process.stdout.write;
+  process.stdout.write = (s) => { chunks.push(s); return true; };
+  try {
+    // Reasoning is dimmed by wrapping each styled line in a linkify transform.
+    const w = createMarkdownWriter(colorOn, (text) => `\x1b[2m${text}\x1b[0m`);
+    w.write("reasoning line\n");
+    assert.ok(chunks.join("").includes("\x1b[2mreasoning line\x1b[0m"), "reasoning body is dimmed");
+  } finally {
+    process.stdout.write = orig;
+  }
+});
+
+check("writer closes unclosed fence on flush", () => {
+  const chunks = [];
+  const orig = process.stdout.write;
+  process.stdout.write = (s) => { chunks.push(s); return true; };
+  try {
+    const w = createMarkdownWriter(colorOff);
+    w.write("```\ncode");
+    w.flush();
+    const joined = chunks.join("");
+    assert.ok(joined.includes("```\ncode\n"), "fence body flushed");
+    assert.ok(joined.endsWith("```\n"), "closing fence emitted");
+  } finally {
+    process.stdout.write = orig;
+  }
+});
+
+// Live mode (fake TTY): partial lines stream token-by-token with padding, then
+// the complete line is restyled in place via a clear sequence.
+check("writer live mode streams partial lines with padding", () => {
+  const chunks = [];
+  const orig = process.stdout.write;
+  const origIsTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+  const origCols = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+  process.stdout.write = (s) => { chunks.push(s); return true; };
+  Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+  Object.defineProperty(process.stdout, "columns", { value: 40, configurable: true });
+  try {
+    const w = createMarkdownWriter(colorOn);
+    w.write("several");
+    // First partial: padded text, no newline, no clear (nothing shown).
+    assert.deepEqual(chunks, ["  several"]);
+    w.write(" words");
+    // Clear the 1-row partial, then rewrite padded.
+    assert.deepEqual(chunks, ["  several", "\x1b[2K", "\r", "  several words"]);
+    w.write("\n");
+    // Line completes: already shown identically, so just close with a newline
+    // (no clear+rewrite → no duplicate-text artifacts in selections).
+    assert.deepEqual(chunks.slice(4), ["\n"]);
+    w.flush();
+    assert.deepEqual(chunks.slice(-2), ["  several words", "\n"]);
+  } finally {
+    process.stdout.write = orig;
+    if (origIsTTY) Object.defineProperty(process.stdout, "isTTY", origIsTTY);
+    else delete process.stdout.isTTY;
+    if (origCols) Object.defineProperty(process.stdout, "columns", origCols);
+    else delete process.stdout.columns;
+  }
+});
+
+// Word wrap: content wraps at word boundaries inside the padded area — a word
+// like "several" must never be split across rows.
+check("writer wraps at word boundaries (no mid-word split)", () => {
+  const chunks = [];
+  const orig = process.stdout.write;
+  const origIsTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+  const origCols = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+  process.stdout.write = (s) => { chunks.push(s); return true; };
+  Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+  Object.defineProperty(process.stdout, "columns", { value: 50, configurable: true }); // width 46
+  try {
+    const w = createMarkdownWriter(colorOn);
+    w.write("several words here testing word wrap boundaries");
+    assert.deepEqual(chunks, ["  several words here testing word wrap", "\n", "  boundaries"]);
+  } finally {
+    process.stdout.write = orig;
+    if (origIsTTY) Object.defineProperty(process.stdout, "isTTY", origIsTTY);
+    else delete process.stdout.isTTY;
+    if (origCols) Object.defineProperty(process.stdout, "columns", origCols);
+    else delete process.stdout.columns;
+  }
+});
+
+// Unbreakable over-long tokens (URLs, code) are hard-split, but words aren't.
+check("writer hard-splits only over-long tokens", () => {
+  const chunks = [];
+  const orig = process.stdout.write;
+  const origIsTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+  const origCols = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+  process.stdout.write = (s) => { chunks.push(s); return true; };
+  Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+  Object.defineProperty(process.stdout, "columns", { value: 40, configurable: true }); // width 36
+  try {
+    const w = createMarkdownWriter(colorOn);
+    w.write("a".repeat(48)); // 48 chars > 36 → hard-split
+    assert.deepEqual(chunks, [`  ${"a".repeat(36)}`, "\n", `  ${"a".repeat(12)}`]);
+  } finally {
+    process.stdout.write = orig;
+    if (origIsTTY) Object.defineProperty(process.stdout, "isTTY", origIsTTY);
+    else delete process.stdout.isTTY;
+    if (origCols) Object.defineProperty(process.stdout, "columns", origCols);
+    else delete process.stdout.columns;
+  }
+});
+
+// Tool tracker: noOutput mode is silent but still assigns ids.
+check("tool tracker noOutput silent", () => {
+  const tracker = new ToolCallTracker({ noOutput: true });
+  const id = tracker.addCall({ function: { name: "read_text_file", arguments: "{}" } });
+  assert.equal(typeof id, "number");
+  tracker.complete(id, 120, false);
+  tracker.complete(id + 1, 120, true); // unknown id — no crash
+});
+
+console.log(`\nAll ${passed} TUI checks passed.`);
