@@ -131,6 +131,18 @@ dsw --permission review -p "audit the auth module"
 dsw --permission full   -p "refactor utils.js to use ES modules"
 ```
 
+### Unattended, scoped work
+
+For an authorized task that may run unattended, seed the task scope at launch and use full permission:
+
+```powershell
+dsw --provider glm --permission full --allow-target example.com,api.example.com --agent-id recon
+```
+
+Repeat `--allow-target` for additional authorized assets, or comma-separate them. While a session is running, the agent can use `scope_add_assets` or `scope_remove_assets`; no replacement agent is needed. For a complete policy, use `--scope-file scope.json`; it accepts the same `allowed_assets`, `excluded_assets`, `allowed_classes`, `excluded_classes`, and `restrictions` fields as `scope_set`.
+
+For HackerOne work, give the coordinator a target first. It should use the existing signed-in PBC profile for a cheap viability pass, record `CONTINUE`, `ESCALATE`, or `DROP`, and only then wake deeper workers.
+
 ---
 
 ## Desktop UI
@@ -180,9 +192,12 @@ In terminals that support OSC-8 hyperlinks, the TUI turns exact workspace file p
 | `analyze_image_openai` | Use OpenAI vision to inspect/transcribe a workspace image; requires `OPENAI_API_KEY` |
 | `search_code` | Regex/literal search across workspace files with glob filter and context lines |
 | `artifact_list` / `artifact_read_range` / `artifact_search` | Bounded retrieval from task-scoped analysis artifacts |
+| `artifact_index` / `artifact_search_all` | Task-wide artifact metadata and bounded cross-artifact search |
 | `sandbox_execute` / `sandbox_manage` | Bounded Docker execution using named ephemeral environments |
 | `scope_get` / `scope_set` / `scope_check` | Structured task authorization state and target checks |
 | `hypothesis_record` / `viability_set` / `roi_record` | Persist negative findings, viability decisions, and task economics |
+| `net_capture_start` / `net_capture_stop` / `net_capture_status` | Bounded ring-buffer capture in the isolated network environment |
+| `model_escalation_get` / `model_escalation_set` / `model_escalation_decide` | Configurable cheap/specialist/verifier routing |
 | `glob` | Discover paths matching a glob pattern (no shell) |
 | `stat_file` | Size, modification time, type, and binary flag for any path |
 | `path_exists` | Check whether a path exists |
@@ -228,6 +243,7 @@ In terminals that support OSC-8 hyperlinks, the TUI turns exact workspace file p
 | `patch_text_file` | Single-file search-and-replace (first occurrence, or all with `replace_all`); CRLF/LF normalized for matching |
 | `run_cmd` | Run a `cmd.exe` command |
 | `run_powershell` | Run a PowerShell command |
+| `run_bash` | Run a Bash command through `bash.exe` (WSL or Git Bash) |
 | `functions_shell_command` | PowerShell with optional workspace-relative `workdir` |
 | `handoff_start` | Start a bounded delegated CLI handoff with prompt, output, and log files |
 | `process_manage` | Start/stop/status/list named detached processes; records persist in `.deepseek-watch/processes.json` so a later wrapper session can stop them; each process has separate logs and optional HTTP readiness checks |

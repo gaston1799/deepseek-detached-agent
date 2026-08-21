@@ -1,54 +1,39 @@
 import { readFile, stat } from "node:fs/promises";
-import { extname, resolve } from "node:path";
+import { resolve } from "node:path";
 import { writeArtifact } from "./artifacts.js";
 
-function asciiStrings(buffer, min = 5, max = 500) {
-  const values = []; let current = "";
-  for (const byte of buffer) {
-    if (byte >= 32 && byte < 127) current += String.fromCharCode(byte);
-    else { if (current.length >= min) values.push(current); current = ""; if (values.length >= max) break; }
-  }
-  if (current.length >= min && values.length < max) values.push(current);
-  return values;
-}
-
-function unique(values) { return [...new Set(values)].slice(0, 200); }
+function strings(buffer, min = 5, max = 5000) { const out = []; let text = ""; for (const byte of buffer) { if (byte >= 32 && byte < 127) text += String.fromCharCode(byte); else { if (text.length >= min) out.push(text); text = ""; if (out.length >= max) break; } } if (text.length >= min && out.length < max) out.push(text); return out; }
+function unique(values, max = 200) { return [...new Set(values)].slice(0, max); }
+function inside(buffer, offset, length) { return offset >= 0 && offset + length <= buffer.length; }
+function ascii(buffer, offset, max = 512) { if (!inside(buffer, offset, 1)) return ""; const end = Math.min(buffer.length, offset + max); const zero = buffer.indexOf(0, offset); return buffer.toString("ascii", offset, zero >= offset && zero < end ? zero : end); }
+function entropy(buffer) { if (!buffer.length) return 0; const counts = new Array(256).fill(0); for (const value of buffer) counts[value] += 1; return -counts.reduce((sum, count) => count ? sum + (count / buffer.length) * Math.log2(count / buffer.length) : sum, 0); }
+function machine(machine) { return ({ 0x8664: "x64", 0x14c: "x86", 0xaa64: "arm64", 0x1c0: "arm" })[machine] || `machine_0x${machine.toString(16)}`; }
+function subsystem(value) { return ({ 2: "windows_gui", 3: "windows_console", 10: "efi_application" })[value] || `subsystem_${value}`; }
 
 export async function peTriage({ cwd = process.cwd(), taskId, path }) {
-  const file = resolve(cwd, path);
-  const info = await stat(file);
-  if (!info.isFile()) throw new Error("PE triage path must be a file.");
+  const file = resolve(cwd, path); const info = await stat(file); if (!info.isFile()) throw new Error("PE triage path must be a file.");
   const buffer = await readFile(file);
-  const result = { path, bytes: buffer.length, is_pe: false, architecture: null, sections: [], imports: [], exports: [], digital_signature: null, clr: false, electron: false, indicators: [], urls: [], domains: [], paths: [] };
-  if (buffer.length < 0x40 || buffer.toString("ascii", 0, 2) !== "MZ") return result;
-  const peOffset = buffer.readUInt32LE(0x3c);
-  if (peOffset + 24 > buffer.length || buffer.toString("ascii", peOffset, peOffset + 4) !== "PE\0\0") return result;
+  const result = { path, bytes: buffer.length, is_pe: false, architecture: null, timestamp: null, entry_point_rva: null, subsystem: null, sections: [], imports: [], exports: [], digital_signature: { present: false }, resources: { present: false, size: 0 }, version_metadata: {}, debug_metadata: {}, clr: false, electron: false, indicators: [], likely_next_tools: [], urls: [], domains: [], paths: [], named_pipes: [], mutexes: [], command_line_options: [] };
+  if (!inside(buffer, 0, 0x40) || buffer.toString("ascii", 0, 2) !== "MZ") return result;
+  const pe = buffer.readUInt32LE(0x3c); if (!inside(buffer, pe, 24) || buffer.toString("ascii", pe, pe + 4) !== "PE\0\0") return result;
   result.is_pe = true;
-  const machine = buffer.readUInt16LE(peOffset + 4);
-  result.architecture = machine === 0x8664 ? "x64" : machine === 0x14c ? "x86" : machine === 0xaa64 ? "arm64" : `machine_0x${machine.toString(16)}`;
-  const sectionCount = buffer.readUInt16LE(peOffset + 6);
-  const optionalSize = buffer.readUInt16LE(peOffset + 20);
-  const optionalOffset = peOffset + 24;
-  const magic = optionalOffset + 2 <= buffer.length ? buffer.readUInt16LE(optionalOffset) : 0;
-  const dataDirectoryOffset = optionalOffset + (magic === 0x20b ? 112 : 96);
-  const importRva = dataDirectoryOffset + 8 <= buffer.length ? buffer.readUInt32LE(dataDirectoryOffset + 8) : 0;
-  const clrRva = dataDirectoryOffset + 8 * 15 + 4 <= buffer.length ? buffer.readUInt32LE(dataDirectoryOffset + 8 * 14) : 0;
-  result.clr = Boolean(clrRva);
-  const sectionOffset = optionalOffset + optionalSize;
-  for (let i = 0; i < sectionCount && sectionOffset + i * 40 + 40 <= buffer.length; i += 1) {
-    const at = sectionOffset + i * 40;
-    result.sections.push({ name: buffer.toString("ascii", at, at + 8).replace(/\0.*$/, ""), virtual_size: buffer.readUInt32LE(at + 8), raw_size: buffer.readUInt32LE(at + 16), characteristics: `0x${buffer.readUInt32LE(at + 36).toString(16)}` });
+  const sectionCount = buffer.readUInt16LE(pe + 6); const timestamp = buffer.readUInt32LE(pe + 8); const optionalSize = buffer.readUInt16LE(pe + 20); const optional = pe + 24;
+  result.architecture = machine(buffer.readUInt16LE(pe + 4)); result.timestamp = timestamp ? new Date(timestamp * 1000).toISOString() : null;
+  if (!inside(buffer, optional, optionalSize)) { result.indicators.push("truncated_optional_header"); return result; }
+  const is64 = buffer.readUInt16LE(optional) === 0x20b; const dataDirs = optional + (is64 ? 112 : 96); result.entry_point_rva = buffer.readUInt32LE(optional + 16); result.subsystem = subsystem(buffer.readUInt16LE(optional + 68));
+  const sections = []; const sectionStart = optional + optionalSize;
+  for (let index = 0; index < sectionCount && inside(buffer, sectionStart + index * 40, 40); index += 1) {
+    const offset = sectionStart + index * 40; const rawSize = buffer.readUInt32LE(offset + 16); const rawOffset = buffer.readUInt32LE(offset + 20); const flags = buffer.readUInt32LE(offset + 36); const data = inside(buffer, rawOffset, rawSize) ? buffer.subarray(rawOffset, rawOffset + rawSize) : Buffer.alloc(0);
+    const row = { name: buffer.toString("ascii", offset, offset + 8).replace(/\0.*$/, ""), virtual_address: buffer.readUInt32LE(offset + 12), virtual_size: buffer.readUInt32LE(offset + 8), raw_offset: rawOffset, raw_size: rawSize, entropy: Number(entropy(data).toFixed(2)), characteristics: `0x${flags.toString(16)}`, readable: Boolean(flags & 0x40000000), writable: Boolean(flags & 0x80000000), executable: Boolean(flags & 0x20000000) }; sections.push(row); result.sections.push(row);
   }
-  const strings = asciiStrings(buffer, 6, 2000);
-  result.urls = unique(strings.filter((value) => /^https?:\/\//i.test(value)));
-  result.domains = unique(strings.filter((value) => /^(?:[a-z0-9-]+\.)+[a-z]{2,}$/i.test(value)));
-  result.paths = unique(strings.filter((value) => /^(?:[A-Za-z]:\\|\\\\|\/home\/|\/opt\/)/.test(value)));
-  result.imports = unique(strings.filter((value) => /\.(?:dll|sys)$/i.test(value)));
-  result.electron = strings.some((value) => /electron|chromium|asar|node\.dll|node_modules/i.test(value));
-  result.digital_signature = strings.some((value) => /Authenticode|WIN_CERTIFICATE/i.test(value)) ? "indicated" : "unknown";
-  if (result.electron) result.indicators.push("electron_or_chromium_strings");
-  if (result.clr) result.indicators.push("clr_dotnet");
-  if (result.sections.some((section) => section.raw_size > 20 * 1024 * 1024)) result.indicators.push("large_embedded_section");
-  const artifact = await writeArtifact({ cwd, taskId, kind: "pe-triage", name: `${path.split(/[\\/]/).pop()}.triage.json`, data: JSON.stringify(result, null, 2), metadata: { source: path } });
+  const rva = (value) => { for (const section of sections) { if (value >= section.virtual_address && value < section.virtual_address + Math.max(section.virtual_size, section.raw_size)) return section.raw_offset + value - section.virtual_address; } return value < buffer.length ? value : -1; };
+  const dir = (index) => inside(buffer, dataDirs + index * 8, 8) ? { rva: buffer.readUInt32LE(dataDirs + index * 8), size: buffer.readUInt32LE(dataDirs + index * 8 + 4) } : { rva: 0, size: 0 };
+  const imports = dir(1); const exports = dir(0); const resources = dir(2); const cert = dir(4); const debug = dir(6); const clr = dir(14);
+  result.resources = { present: Boolean(resources.rva && resources.size), size: resources.size }; result.digital_signature = { present: Boolean(cert.rva && cert.size), offset: cert.rva || null, size: cert.size }; result.debug_metadata = { present: Boolean(debug.rva && debug.size), entries: Math.floor(debug.size / 28) }; result.clr = Boolean(clr.rva && clr.size);
+  for (let index = 0; imports.rva && index < 512; index += 1) { const offset = rva(imports.rva + index * 20); if (!inside(buffer, offset, 20)) break; const orig = buffer.readUInt32LE(offset); const nameRva = buffer.readUInt32LE(offset + 12); const first = buffer.readUInt32LE(offset + 16); if (!orig && !nameRva && !first) break; const functions = []; const thunk = orig || first; const width = is64 ? 8 : 4; for (let item = 0; item < 512; item += 1) { const thunkOffset = rva(thunk + item * width); if (!inside(buffer, thunkOffset, width)) break; const value = is64 ? Number(buffer.readBigUInt64LE(thunkOffset)) : buffer.readUInt32LE(thunkOffset); if (!value) break; if (value & (is64 ? 0x8000000000000000 : 0x80000000)) functions.push(`ordinal_${value & 0xffff}`); else functions.push(ascii(buffer, rva(value) + 2, 260)); } result.imports.push({ dll: ascii(buffer, rva(nameRva), 260), functions: unique(functions.filter(Boolean), 150) }); }
+  if (exports.rva && inside(buffer, rva(exports.rva), 40)) { const offset = rva(exports.rva); const count = Math.min(buffer.readUInt32LE(offset + 24), 500); const names = buffer.readUInt32LE(offset + 32); const values = []; for (let index = 0; index < count; index += 1) { const nameOffset = rva(names + index * 4); if (!inside(buffer, nameOffset, 4)) break; values.push(ascii(buffer, rva(buffer.readUInt32LE(nameOffset)), 260)); } result.exports = { dll: ascii(buffer, rva(buffer.readUInt32LE(offset + 12)), 260), names: unique(values.filter(Boolean), 500) }; }
+  const all = strings(buffer); result.urls = unique(all.filter((value) => /^https?:\/\//i.test(value))); result.domains = unique(all.filter((value) => /^(?:[a-z0-9-]+\.)+[a-z]{2,}$/i.test(value))); result.paths = unique(all.filter((value) => /^(?:[A-Za-z]:\\|\\\\|\/home\/|\/opt\/|\/tmp\/)/.test(value))); result.named_pipes = unique(all.filter((value) => /\\\\\.\\pipe\\/i.test(value))); result.mutexes = unique(all.filter((value) => /(?:mutex|mutant)/i.test(value)), 100); result.command_line_options = unique(all.filter((value) => /^--?[a-z][a-z0-9_-]{2,}/i.test(value)), 100); result.electron = all.some((value) => /electron|chromium|asar|node\.dll|node_modules/i.test(value)); result.version_metadata = { product_name: all.find((value) => /productname/i.test(value)) || null, file_description: all.find((value) => /filedescription/i.test(value)) || null };
+  if (result.electron) { result.indicators.push("electron_or_chromium_strings"); result.likely_next_tools.push("electron_analysis"); } if (result.clr) { result.indicators.push("clr_dotnet"); result.likely_next_tools.push("managed_code_analysis"); } if (sections.some((item) => item.raw_size > 20 * 1024 * 1024)) result.indicators.push("large_embedded_section"); if (sections.some((item) => item.entropy >= 7.3)) { result.indicators.push("high_entropy_section_possible_packer"); result.likely_next_tools.push("native_re_analysis"); } if (!result.likely_next_tools.length) result.likely_next_tools.push("native_re_analysis");
+  const artifact = await writeArtifact({ cwd, taskId, kind: "pe-triage", name: `${path.split(/[\\/]/).pop()}.triage.json`, data: JSON.stringify(result, null, 2), metadata: { source: path, architecture: result.architecture, clr: result.clr, electron: result.electron } });
   return { ...result, artifact };
 }

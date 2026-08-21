@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { appendFile, mkdir, open, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
-import { closeSync, openSync } from "node:fs";
+import { closeSync, existsSync, openSync } from "node:fs";
 import { platform, release, arch, userInfo } from "node:os";
 import { dirname, extname, isAbsolute, join, resolve, relative } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -35,10 +35,10 @@ import {
 } from "./agent-coordination.js";
 import { discoverSkills, formatSkillList, renderLoadedSkills, resolveSkill, runSkillCommand, skillRootsWithSources, skillUsage } from "./skills.js";
 import { boundedSearch } from "./search.js";
-import { getArtifact, listArtifacts, readArtifactRange, searchArtifact, writeArtifact } from "./artifacts.js";
+import { getArtifact, getArtifactIndex, listArtifacts, readArtifactRange, searchArtifact, searchArtifacts, writeArtifact } from "./artifacts.js";
 import { SANDBOX_ENVIRONMENTS, sandboxExecute, sandboxOperation } from "./sandbox.js";
-import { checkScope, getScope, recordHypothesis, recordRoi, recordViability, setScope } from "./task-state.js";
-import { netConversations, netExtractFields, netListInterfaces, netProtocolSummary, netQueryPcap, netStreamSummary } from "./net-tools.js";
+import { addScopeAssets, checkScope, decideEscalation, getEscalationPolicy, getScope, recordHypothesis, recordRoi, recordViability, removeScopeAssets, requireScope, setEscalationPolicy, setScope } from "./task-state.js";
+import { netCaptureStart, netCaptureStatus, netCaptureStop, netConversations, netExtractFields, netListInterfaces, netProtocolSummary, netQueryPcap, netStreamSummary } from "./net-tools.js";
 import { peTriage } from "./triage.js";
 
 const DEFAULT_PROVIDER = "deepseek";
@@ -112,6 +112,8 @@ Options:
                                parallel runs tool calls concurrently; sequential runs in order. Default: parallel
   --permission <review|ask|full>
                                Session permission level. review=read-only, ask=prompt for shell, full=auto-run shell.
+  --allow-target <asset>        Seed reviewed task scope with an allowed domain or URL. Repeatable.
+  --scope-file <file>           Seed reviewed task scope from a JSON file with allowed/excluded assets/classes.
   --session <file>             Session memory JSON file. Default: new timestamped session.
   --resume                     Resume from --session, or pick a recent session if omitted.
   --new                        Start a fresh session for --agent-id instead of resuming its existing one.
@@ -179,7 +181,9 @@ function parseArgs(argv) {
     compactAt: Number.parseFloat(process.env.DEEPSEEK_COMPACT_AT || "0.9"),
     compactMethod: process.env.DEEPSEEK_COMPACT_METHOD || "auto",
     contextLimit: process.env.DEEPSEEK_CONTEXT_LIMIT ? Number.parseInt(process.env.DEEPSEEK_CONTEXT_LIMIT, 10) : null,
-    compactKeepRecent: Number.parseInt(process.env.DEEPSEEK_COMPACT_KEEP_RECENT || "40", 10)
+    compactKeepRecent: Number.parseInt(process.env.DEEPSEEK_COMPACT_KEEP_RECENT || "40", 10),
+    allowedTargets: [],
+    scopeFile: null
   };
   let modelExplicit = false;
   let baseUrlExplicit = false;
@@ -222,6 +226,8 @@ function parseArgs(argv) {
     else if (arg === "--max-tool-turns") opts.maxToolTurns = Number.parseInt(next(), 10);
     else if (arg === "--tool-mode") opts.toolMode = next();
     else if (arg === "--permission") opts.permission = next();
+    else if (arg === "--allow-target") opts.allowedTargets.push(...next().split(",").map((item) => item.trim()).filter(Boolean));
+    else if (arg === "--scope-file") opts.scopeFile = next();
     else if (arg === "--session") {
       opts.session = next();
       opts.explicitSession = true;
@@ -273,6 +279,7 @@ function validateOpts(opts) {
   if (opts.permission && !["review", "ask", "full"].includes(opts.permission)) throw new Error("--permission must be review, ask, or full.");
   if (opts.resume && !opts.saveSession) throw new Error("--resume cannot be combined with --no-save-session.");
   if (opts.resume && opts.newSession) throw new Error("--resume and --new cannot be combined.");
+  if (opts.scopeFile && opts.allowedTargets.length) throw new Error("Use --scope-file or --allow-target, not both.");
   if (opts.noOutput && !opts.output) throw new Error("--no-output requires --output <file> or --outfile <file>.");
   if (opts.fullChat && !opts.output) throw new Error("--full-chat requires --output <file> or --outfile <file>.");
   if (!Number.isFinite(opts.compactAt) || opts.compactAt <= 0 || opts.compactAt > 1) throw new Error("--compact-at must be a fraction in (0, 1].");
@@ -601,7 +608,7 @@ function createStatusLine(opts, phrase = "Working", initialTokens = 0) {
 function toolStatusPhrase(name) {
   if (name === "write_text_file") return "Writing file";
   if (name === "patch_text_file" || name === "patch_files") return "Patching files";
-  if (name === "run_cmd" || name === "run_powershell" || name === "functions_shell_command" || name === "functions.shell_command") return "Running command";
+  if (name === "run_cmd" || name === "run_bash" || name === "run_powershell" || name === "functions_shell_command" || name === "functions.shell_command") return "Running command";
   if (name === "web_search" || name === "web_fetch") return "Reading web";
   if (name === "analyze_image_openai" || name === "view_image") return "Reading image";
   return randomStatusPhrase(["Running tool", "Working", "Processing"]);
@@ -831,7 +838,10 @@ function nowIso() {
 }
 
 function jsonResult(value) {
-  return JSON.stringify(value, null, 2);
+  const text = JSON.stringify(value, null, 2);
+  const max = 24000;
+  if (text.length <= max) return text;
+  return JSON.stringify({ truncated: true, preview: text.slice(0, max), total_chars: text.length, note: "Tool result exceeded the context limit; use the referenced artifact, pagination, or a narrower query." }, null, 2);
 }
 
 function parseCommandLineArgs(value) {
@@ -1937,9 +1947,25 @@ function toolSchemas(opts) {
     {
       type: "function",
       function: {
+        name: "artifact_index",
+        description: "Return the task-wide artifact index: metadata, tags, byte size, and searchability.",
+        parameters: { type: "object", properties: {}, additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "artifact_search_all",
+        description: "Search all indexed text artifacts and return bounded snippets with artifact references.",
+        parameters: { type: "object", properties: { pattern: { type: "string" }, max_matches: { type: "number" }, context_chars: { type: "number" } }, required: ["pattern"], additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
         name: "sandbox_execute",
         description: "Execute a bounded command in a named ephemeral Docker environment. Output is capped and stored as an artifact.",
-        parameters: { type: "object", properties: { environment: { type: "string", enum: Object.keys(SANDBOX_ENVIRONMENTS) }, command: { type: "string" }, timeout_ms: { type: "number" }, working_directory: { type: "string" }, cpu: { type: "number" }, memory_mb: { type: "number" }, network_policy: { type: "string", enum: ["none", "allowlisted"] }, persistence: { type: "string", enum: ["ephemeral", "persistent"] }, env: { type: "object" } }, required: ["environment", "command"], additionalProperties: false }
+        parameters: { type: "object", properties: { environment: { type: "string", enum: Object.keys(SANDBOX_ENVIRONMENTS) }, command: { type: "string" }, timeout_ms: { type: "number" }, working_directory: { type: "string" }, cpu: { type: "number" }, memory_mb: { type: "number" }, network_policy: { type: "string", enum: ["none", "allowlisted"] }, target: { type: "string", description: "Required when allowlisted network access is requested; checked against task scope." }, vulnerability_class: { type: "string" }, persistence: { type: "string", enum: ["ephemeral", "persistent"] }, env: { type: "object" } }, required: ["environment", "command"], additionalProperties: false }
       }
     },
     {
@@ -1947,7 +1973,7 @@ function toolSchemas(opts) {
       function: {
         name: "sandbox_manage",
         description: "Create, inspect, execute, copy, retrieve logs, stop, destroy, or list Docker sandbox environments/containers.",
-        parameters: { type: "object", properties: { operation: { type: "string", enum: ["create", "exec", "copy_in", "copy_out", "inspect", "logs", "stop", "destroy", "list_environments", "list_containers"] }, environment: { type: "string", enum: Object.keys(SANDBOX_ENVIRONMENTS) }, container: { type: "string" }, command: { type: "string" }, source: { type: "string" }, destination: { type: "string" }, timeout_ms: { type: "number" } }, required: ["operation"], additionalProperties: false }
+        parameters: { type: "object", properties: { operation: { type: "string", enum: ["create", "exec", "copy_in", "copy_out", "inspect", "logs", "stop", "destroy", "cleanup_orphans", "list_environments", "list_containers"] }, environment: { type: "string", enum: Object.keys(SANDBOX_ENVIRONMENTS) }, container: { type: "string" }, command: { type: "string" }, source: { type: "string" }, destination: { type: "string" }, target: { type: "string", description: "Required when creating the web-testing environment." }, vulnerability_class: { type: "string" }, timeout_ms: { type: "number" } }, required: ["operation"], additionalProperties: false }
       }
     },
     {
@@ -1977,6 +2003,22 @@ function toolSchemas(opts) {
     {
       type: "function",
       function: {
+        name: "scope_add_assets",
+        description: "Add authorized assets to the current task scope without replacing existing scope state. Use for a new in-scope HackerOne asset in the same session.",
+        parameters: { type: "object", properties: { assets: { type: "array", items: { type: "string" } } }, required: ["assets"], additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "scope_remove_assets",
+        description: "Remove authorized assets from the current task scope without changing other policy fields.",
+        parameters: { type: "object", properties: { assets: { type: "array", items: { type: "string" } } }, required: ["assets"], additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
         name: "hypothesis_record",
         description: "Persist a tested hypothesis, evidence, outcome, rejection reason, and artifact references.",
         parameters: { type: "object", properties: { hypothesis: { type: "string" }, evidence: { type: "string" }, test: { type: "string" }, outcome: { type: "string" }, rejected_reason: { type: "string" }, artifacts: { type: "array", items: { type: "string" } } }, required: ["hypothesis", "test", "outcome"], additionalProperties: false }
@@ -2001,6 +2043,30 @@ function toolSchemas(opts) {
     {
       type: "function",
       function: {
+        name: "model_escalation_get",
+        description: "Read the configurable cheap-worker, specialist, and verifier escalation policy for this task.",
+        parameters: { type: "object", properties: {}, additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "model_escalation_set",
+        description: "Set a task-local model escalation policy. This chooses recommendations; it does not invoke an external model automatically.",
+        parameters: { type: "object", properties: { cheap_models: { type: "array", items: { type: "string" } }, specialist_models: { type: "array", items: { type: "string" } }, verifier_models: { type: "array", items: { type: "string" } }, max_cheap_passes: { type: "number" }, escalate_on: { type: "array", items: { type: "string" } } }, additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "model_escalation_decide",
+        description: "Recommend cheap, specialist, or verifier model based on task complexity, evidence confidence, and cheap-worker passes.",
+        parameters: { type: "object", properties: { complexity: { type: "string", enum: ["low", "medium", "high"] }, finding_confidence: { type: "string", enum: ["none", "ambiguous", "credible", "high", "validated"] }, cheap_passes: { type: "number" } }, additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
         name: "pe_triage",
         description: "Perform bounded first-pass PE triage and route indicators to specialist analysis.",
         parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"], additionalProperties: false }
@@ -2011,6 +2077,30 @@ function toolSchemas(opts) {
       function: {
         name: "net_list_interfaces",
         description: "List capture interfaces inside the network-analysis environment.",
+        parameters: { type: "object", properties: {}, additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "net_capture_start",
+        description: "Start a bounded, ring-buffered packet capture in the isolated network-analysis environment. Capture is local to that environment and stored as an artifact when stopped.",
+        parameters: { type: "object", properties: { interface: { type: "string" }, duration_seconds: { type: "number", description: "1-600; default 60." }, max_file_mb: { type: "number", description: "1-250; default 50." }, ring_files: { type: "number", description: "1-10; default 2." }, name: { type: "string" } }, required: ["interface"], additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "net_capture_stop",
+        description: "Stop a named isolated packet capture, register its PCAPNG artifact, and destroy the capture container.",
+        parameters: { type: "object", properties: { name: { type: "string" } }, required: ["name"], additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "net_capture_status",
+        description: "List active bounded packet captures for this task.",
         parameters: { type: "object", properties: {}, additionalProperties: false }
       }
     },
@@ -2339,6 +2429,23 @@ function toolSchemas(opts) {
           properties: {
             command: { type: "string", description: "Command text to pass to cmd.exe /d /s /c." },
             path: { type: "string", description: "Working directory for the command. Absolute paths are used as-is; relative paths resolve against the workspace root. Defaults to the workspace root." },
+            timeout_ms: { type: "number", description: "Timeout in milliseconds. Defaults to 60000." }
+          },
+          required: ["command"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "run_bash",
+        description: "Request execution of a Bash command through bash.exe (WSL or Git Bash on Windows). The user is prompted unless dangerous auto-run mode is enabled.",
+        parameters: {
+          type: "object",
+          properties: {
+            command: { type: "string", description: "Bash command text passed to bash -lc." },
+            path: { type: "string", description: "Working directory. Absolute paths are used as-is; relative paths resolve against the workspace root." },
             timeout_ms: { type: "number", description: "Timeout in milliseconds. Defaults to 60000." }
           },
           required: ["command"],
@@ -2901,8 +3008,11 @@ function runLocalCommand(exe, args, timeoutMs, cwd = process.cwd()) {
       stdio: ["ignore", "pipe", "pipe"]
     });
 
+    const maxOutput = 24000;
     let stdout = "";
     let stderr = "";
+    let stdoutChars = 0;
+    let stderrChars = 0;
     let timedOut = false;
     let settled = false;
     let timer;
@@ -2912,8 +3022,8 @@ function runLocalCommand(exe, args, timeoutMs, cwd = process.cwd()) {
       clearTimeout(timer);
       const parts = [`exit_code=${code ?? "unknown"}`];
       if (timedOut) parts.push("timed_out=true");
-      if (stdout.trim()) parts.push(`stdout:\n${stdout.trimEnd()}`);
-      if (stderr.trim()) parts.push(`stderr:\n${stderr.trimEnd()}`);
+      if (stdout.trim()) parts.push(`stdout:\n${stdout.trimEnd()}${stdoutChars > stdout.length ? `\n…[truncated ${stdoutChars - stdout.length} chars]` : ""}`);
+      if (stderr.trim()) parts.push(`stderr:\n${stderr.trimEnd()}${stderrChars > stderr.length ? `\n…[truncated ${stderrChars - stderr.length} chars]` : ""}`);
       resolvePromise(parts.join("\n"));
     };
     timer = setTimeout(() => {
@@ -2926,8 +3036,8 @@ function runLocalCommand(exe, args, timeoutMs, cwd = process.cwd()) {
 
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
-    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.stdout.on("data", (chunk) => { stdoutChars += chunk.length; if (stdout.length < maxOutput) stdout += chunk.slice(0, maxOutput - stdout.length); });
+    child.stderr.on("data", (chunk) => { stderrChars += chunk.length; if (stderr.length < maxOutput) stderr += chunk.slice(0, maxOutput - stderr.length); });
     child.on("error", (error) => {
       if (settled) return;
       settled = true;
@@ -3381,7 +3491,18 @@ async function maybeRunShellTool(opts, shellName, command, timeoutMs, cwd = proc
   }
 
   if (shellName === "cmd") return runLocalCommand("cmd.exe", ["/d", "/s", "/c", command], timeout, cwd);
+  if (shellName === "bash") return runLocalCommand(resolveBashExecutable(), ["-lc", command], timeout, cwd);
   return runLocalCommand("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command], timeout, cwd);
+}
+
+function resolveBashExecutable() {
+  if (process.env.DSW_BASH_PATH) return process.env.DSW_BASH_PATH;
+  if (platform() === "win32") {
+    for (const candidate of ["C:\\Program Files\\Git\\bin\\bash.exe", "C:\\Program Files\\Git\\usr\\bin\\bash.exe"]) {
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  return "bash.exe";
 }
 
 function activeSession(opts) {
@@ -4044,6 +4165,10 @@ function patchEolTolerant(content, oldString, newString, { replaceAll = false } 
     return maybeRunShellTool(opts, "cmd", args.command, args.timeout_ms, resolveShellCwd(args.path));
   }
 
+  if (name === "run_bash") {
+    return maybeRunShellTool(opts, "bash", args.command, args.timeout_ms, resolveShellCwd(args.path));
+  }
+
   if (name === "run_powershell") {
     return maybeRunShellTool(opts, "powershell", args.command, args.timeout_ms, resolveShellCwd(args.path));
   }
@@ -4056,22 +4181,38 @@ function patchEolTolerant(content, oldString, newString, { replaceAll = false } 
   if (name === "artifact_list") return jsonResult(await listArtifacts({ cwd: process.cwd(), taskId: opts.agentId || opts.session }));
   if (name === "artifact_read_range") return jsonResult(await readArtifactRange({ cwd: process.cwd(), taskId: opts.agentId || opts.session, artifact: args.artifact, offset: args.offset, maxBytes: args.max_bytes }));
   if (name === "artifact_search") return jsonResult(await searchArtifact({ cwd: process.cwd(), taskId: opts.agentId || opts.session, artifact: args.artifact, pattern: args.pattern, maxMatches: args.max_matches, contextChars: args.context_chars }));
-  if (name === "pe_triage") return jsonResult(await peTriage({ cwd: process.cwd(), taskId: opts.agentId || opts.session, path: args.path }));
-  if (name === "net_list_interfaces") return jsonResult(await netListInterfaces({ cwd: process.cwd(), taskId: opts.agentId || opts.session }));
+  if (name === "artifact_index") return jsonResult(await getArtifactIndex({ cwd: process.cwd(), taskId: opts.agentId || opts.session }));
+  if (name === "artifact_search_all") return jsonResult(await searchArtifacts({ cwd: process.cwd(), taskId: opts.agentId || opts.session, pattern: args.pattern, maxMatches: args.max_matches, contextChars: args.context_chars }));
+  const taskKey = opts.agentId || opts.session;
+  if (name === "pe_triage") return jsonResult(await peTriage({ cwd: process.cwd(), taskId: taskKey, path: args.path }));
+  if (name === "net_list_interfaces") return jsonResult(await netListInterfaces({ cwd: process.cwd(), taskId: taskKey }));
+  if (name === "net_capture_start") return jsonResult(await netCaptureStart({ cwd: process.cwd(), taskId: taskKey, interface: args.interface, durationSeconds: args.duration_seconds, maxFileMb: args.max_file_mb, ringFiles: args.ring_files, name: args.name }));
+  if (name === "net_capture_stop") return jsonResult(await netCaptureStop({ cwd: process.cwd(), taskId: taskKey, name: args.name }));
+  if (name === "net_capture_status") return jsonResult(await netCaptureStatus({ cwd: process.cwd(), taskId: taskKey }));
   if (name === "net_protocol_summary") return jsonResult(await netProtocolSummary({ cwd: process.cwd(), taskId: opts.agentId || opts.session, artifact: args.artifact }));
   if (name === "net_conversations") return jsonResult(await netConversations({ cwd: process.cwd(), taskId: opts.agentId || opts.session, artifact: args.artifact }));
   if (name === "net_query_pcap") return jsonResult(await netQueryPcap({ cwd: process.cwd(), taskId: opts.agentId || opts.session, artifact: args.artifact, filter: args.filter, fields: args.fields }));
   if (name === "net_stream_summary") return jsonResult(await netStreamSummary({ cwd: process.cwd(), taskId: opts.agentId || opts.session, artifact: args.artifact }));
-  if (name === "sandbox_execute") return jsonResult(await sandboxExecute({ cwd: process.cwd(), taskId: opts.agentId || opts.session, environment: args.environment, command: args.command, timeoutMs: args.timeout_ms, workingDirectory: args.working_directory, cpu: args.cpu, memoryMb: args.memory_mb, networkPolicy: args.network_policy, persistence: args.persistence, env: args.env }));
-  if (name === "sandbox_manage") return jsonResult(await sandboxOperation({ cwd: process.cwd(), taskId: opts.agentId || opts.session, ...args }));
-  const taskKey = opts.agentId || opts.session;
+  if (name === "sandbox_execute") {
+    if ((args.network_policy || SANDBOX_ENVIRONMENTS[args.environment]?.network) === "allowlisted") await requireScope(process.cwd(), taskKey, args.target, args.vulnerability_class);
+    return jsonResult(await sandboxExecute({ cwd: process.cwd(), taskId: taskKey, environment: args.environment, command: args.command, timeoutMs: args.timeout_ms, workingDirectory: args.working_directory, cpu: args.cpu, memoryMb: args.memory_mb, networkPolicy: args.network_policy, persistence: args.persistence, env: args.env }));
+  }
+  if (name === "sandbox_manage") {
+    if (args.environment === "web-testing") await requireScope(process.cwd(), taskKey, args.target, args.vulnerability_class);
+    return jsonResult(await sandboxOperation({ cwd: process.cwd(), taskId: taskKey, ...args }));
+  }
   if (name === "scope_get") return jsonResult(await getScope(process.cwd(), taskKey));
   if (name === "scope_check") return jsonResult(await checkScope(process.cwd(), taskKey, args.target, args.vulnerability_class));
-  if (["scope_set", "hypothesis_record", "viability_set", "roi_record"].includes(name) && opts.permission === "review") return "blocked by session permission: review only";
+  if (["scope_set", "scope_add_assets", "scope_remove_assets", "hypothesis_record", "viability_set", "roi_record", "model_escalation_set"].includes(name) && opts.permission === "review") return "blocked by session permission: review only";
   if (name === "scope_set") return jsonResult(await setScope(process.cwd(), taskKey, args));
+  if (name === "scope_add_assets") return jsonResult(await addScopeAssets(process.cwd(), taskKey, args.assets));
+  if (name === "scope_remove_assets") return jsonResult(await removeScopeAssets(process.cwd(), taskKey, args.assets));
   if (name === "hypothesis_record") return jsonResult(await recordHypothesis(process.cwd(), taskKey, args));
   if (name === "viability_set") return jsonResult(await recordViability(process.cwd(), taskKey, args));
   if (name === "roi_record") return jsonResult(await recordRoi(process.cwd(), taskKey, args));
+  if (name === "model_escalation_get") return jsonResult(await getEscalationPolicy(process.cwd(), taskKey));
+  if (name === "model_escalation_set") return jsonResult(await setEscalationPolicy(process.cwd(), taskKey, args));
+  if (name === "model_escalation_decide") return jsonResult(await decideEscalation(process.cwd(), taskKey, args));
 
   if (name === "search_code") {
     return jsonResult(await boundedSearch({
@@ -4360,13 +4501,7 @@ function patchEolTolerant(content, oldString, newString, { replaceAll = false } 
 
   if (name.startsWith("sec_")) {
     const target = args.url || args.domain || args.host || "";
-    if (target) {
-      const scope = await getScope(process.cwd(), opts.agentId || opts.session);
-      if (scope.allowed_assets.length || scope.excluded_assets.length) {
-        const decision = await checkScope(process.cwd(), opts.agentId || opts.session, target, args.vulnerability_class);
-        if (!decision.allowed) throw new Error(`Target blocked by task scope: ${decision.reason}`);
-      }
-    }
+    if (target) await requireScope(process.cwd(), taskKey, target, args.vulnerability_class);
     return runSecurityTool(name, args, { ...opts, askYesNo });
   }
 
@@ -4404,7 +4539,7 @@ function shouldRunToolsSequentially(opts, calls) {
   if (opts.toolMode === "sequential") return true;
   if (calls.some((call) => call.function?.name === "agent_wait")) return true;
   if (opts.dangerouslyAutoRunCommands) return false;
-  return calls.some((call) => ["run_cmd", "run_powershell", "functions_shell_command", "functions.shell_command"].includes(call.function?.name));
+  return calls.some((call) => ["run_cmd", "run_bash", "run_powershell", "functions_shell_command", "functions.shell_command"].includes(call.function?.name));
 }
 
 function repairToolCallHistory(messages) {
@@ -5501,6 +5636,12 @@ async function run() {
     workspace: process.cwd(),
     session: opts.session
   });
+  if (opts.scopeFile || opts.allowedTargets.length) {
+    let launchScope = { allowed_assets: opts.allowedTargets };
+    if (opts.scopeFile) launchScope = JSON.parse(await readFile(resolve(process.cwd(), opts.scopeFile), "utf8"));
+    const savedScope = await setScope(process.cwd(), opts.agentId || opts.session, launchScope);
+    if (!opts.noOutput) process.stderr.write(`Task scope: ${savedScope.allowed_assets.length} allowed asset${savedScope.allowed_assets.length === 1 ? "" : "s"}\n`);
+  }
   if (!opts.noOutput) process.stderr.write(`Agent: ${opts.agentId} (${opts.agentRole})\nCoordination: ${opts.coordDir}\n`);
 
   if (opts.resume || autoAgentSession) {

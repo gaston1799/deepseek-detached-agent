@@ -25,6 +25,7 @@
     "test:sandbox": "node scripts/self-test-sandbox.mjs",
     "test:task-state": "node scripts/self-test-task-state.mjs",
     "test:triage": "node scripts/self-test-triage.mjs",
+    "test:foundation": "node scripts/self-test-foundation.mjs",
     "test:coordination": "node scripts/self-test-coordination.mjs",
     "test:coordination:e2e": "node scripts/self-test-agent-wake.mjs",
     "smoke": "node src/deepseek-watch.js --help && node src/deepseek-detached.js --help && node src/wait-for-file.js --help",

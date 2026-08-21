@@ -8,4 +8,5 @@ for (const name of ["linux-general", "linux-re", "web-testing", "fuzzing", "netw
   assert.ok(environments.some((item) => item.name === name));
 }
 assert.equal(SANDBOX_ENVIRONMENTS["linux-general"].network, "none");
+assert.deepEqual(SANDBOX_ENVIRONMENTS["network-analysis"].capabilities, ["NET_ADMIN", "NET_RAW"]);
 console.log("sandbox profile checks passed");
