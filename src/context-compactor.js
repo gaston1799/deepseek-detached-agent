@@ -23,7 +23,8 @@ import { spawn } from "node:child_process";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { deepSeekHttpError } from "./api-error.js";
-import { getDeepSeekApiKey } from "./config.js";
+import { getProviderApiKey } from "./config.js";
+import { providerConfig } from "./providers.js";
 import { applyThinkingOptions } from "./deepseek-request.js";
 import { isRetryableFetchError, retryBackoffMs } from "./fetch-retry.js";
 
@@ -201,8 +202,9 @@ const SUMMARIZER_SYSTEM_PROMPT = [
 // ---------------------------------------------------------------------------
 
 export async function summarizeWithLlm(opts, transcript) {
-  const apiKey = await getDeepSeekApiKey();
-  if (!apiKey) throw new Error("No DeepSeek API key found for context compaction (set one with `dsw config set-key <key>`).");
+  const provider = providerConfig(opts.provider || "deepseek");
+  const apiKey = await getProviderApiKey(opts.provider || "deepseek");
+  if (!apiKey) throw new Error(`No ${provider.label} API key found for context compaction.`);
 
   const body = {
     model: opts.model,
@@ -221,7 +223,7 @@ export async function summarizeWithLlm(opts, transcript) {
       const timer = setTimeout(() => controller.abort(), COMPACT_TIMEOUT_MS);
       let response;
       try {
-        response = await fetch(`${String(opts.baseUrl || "https://api.deepseek.com").replace(/\/$/, "")}/chat/completions`, {
+        response = await fetch(`${String(opts.baseUrl || provider.baseUrl).replace(/\/$/, "")}/chat/completions`, {
           method: "POST",
           signal: controller.signal,
           headers: {
@@ -233,7 +235,7 @@ export async function summarizeWithLlm(opts, transcript) {
       } finally {
         clearTimeout(timer);
       }
-      if (!response.ok) throw await deepSeekHttpError(response);
+      if (!response.ok) throw await deepSeekHttpError(response, provider.label);
       const data = await response.json();
       const summary = String(data.choices?.[0]?.message?.content || "").trim();
       if (!summary) throw new Error("compactor returned an empty summary.");

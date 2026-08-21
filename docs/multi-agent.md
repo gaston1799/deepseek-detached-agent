@@ -9,10 +9,11 @@ Use one shared absolute coordination directory. Writers should use separate Git 
 ```powershell
 d --agent-id coordinator --agent-role coordinator --agent-mission "Plan, delegate, and review." --coord-dir D:\MyServer\.deepseek-watch\coordination -p "Explore the repository, discover running agents, and coordinate a course to finish the project."
 
-d --agent-id worker-storage --agent-role worker --agent-mission "Implement storage reconciliation and warning delivery." --coord-dir D:\MyServer\.deepseek-watch\coordination -p "Discover the coordinator, inspect shared tasks, claim your assigned task, and begin."
+d --agent-id worker-storage --agent-role worker --coordinator-id coordinator --agent-mission "Implement storage reconciliation and warning delivery." --coord-dir D:\MyServer\.deepseek-watch\coordination -p "Announce yourself to the coordinator, inspect shared tasks, claim your assigned task, and begin."
 ```
 
 When `--agent-id` is omitted, the wrapper generates an ID, prints it, saves it in session configuration, and restores it on resume. Every model system prompt includes the current ID, role, mission, and coordination directory.
+When a worker knows the coordinator ID, pass `--coordinator-id` (or set `DEEPSEEK_COORDINATOR_ID`). The system prompt tells the worker to send its initial status directly to that coordinator before using `agent_list`.
 
 ## Operator commands
 

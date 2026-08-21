@@ -22,7 +22,8 @@
 - **Claude fallback** — `dsd` falls back to `claude -p` if DeepSeek is unavailable
 - **Dependency-light CLI** — core agent tools use built-in Node APIs; Electron is used only for `d -ui`
 - **OpenAI-compatible** — point at any compatible endpoint via `--base-url`
-- **Auto context compaction** — when a session's estimated input approaches the model context window (default: trigger at 90% of 1,048,576 tokens), older messages are folded into a single structured summary while the recent tail stays verbatim; the agent keeps working without hitting `HTTP 400: maximum context length`
+- **GLM support** — use Z.AI's OpenAI-compatible GLM API with `--provider glm`
+- **Dynamic auto context compaction** — at the default 90% trigger, the wrapper follows the selected provider/model context window (GLM-4.7: 200K; older GLM-4.5/GLM-4-32B variants: 128K; DeepSeek v4: 1,048,576) and reserves the configured completion budget; use `--compact-limit <tokens>` for a custom endpoint/model
 
 ---
 
@@ -47,7 +48,7 @@ sent and compacts:
   `from_tokens`/`to_tokens`/method and printed as a ⚠ status line.
 
 CLI flags: `--compact-at <pct>` (default 0.9), `--compact-method <auto|llm|truncate|detached|off>`,
-`--compact-limit <tokens>` (default 1048576), `--compact-keep-recent <n>` (default 40), `--no-compact`.
+`--compact-limit <tokens|auto>` (default `auto`), `--compact-keep-recent <n>` (default 40), `--no-compact`.
 Environment equivalents: `DEEPSEEK_COMPACT_AT`, `DEEPSEEK_COMPACT_METHOD`, `DEEPSEEK_CONTEXT_LIMIT`,
 `DEEPSEEK_COMPACT_KEEP_RECENT`.
 
@@ -178,6 +179,10 @@ In terminals that support OSC-8 hyperlinks, the TUI turns exact workspace file p
 | `view_image` | Read a workspace image and return metadata, dimensions, and a data URL when small enough; does not visually interpret content |
 | `analyze_image_openai` | Use OpenAI vision to inspect/transcribe a workspace image; requires `OPENAI_API_KEY` |
 | `search_code` | Regex/literal search across workspace files with glob filter and context lines |
+| `artifact_list` / `artifact_read_range` / `artifact_search` | Bounded retrieval from task-scoped analysis artifacts |
+| `sandbox_execute` / `sandbox_manage` | Bounded Docker execution using named ephemeral environments |
+| `scope_get` / `scope_set` / `scope_check` | Structured task authorization state and target checks |
+| `hypothesis_record` / `viability_set` / `roi_record` | Persist negative findings, viability decisions, and task economics |
 | `glob` | Discover paths matching a glob pattern (no shell) |
 | `stat_file` | Size, modification time, type, and binary flag for any path |
 | `path_exists` | Check whether a path exists |
@@ -444,6 +449,7 @@ dswait out.md --timeout 120000   # wait up to 2 min
 
 ```bash
 dsw config set-key <key>   # save to %APPDATA%\deepseek-detached-agent\config.json
+dsw config set-glm-key <key> # save a Z.AI GLM key in the same config file
 dsw config set-google-search-key <key>
 dsw config set-google-search-engine-id <engine-id>
 dsw config path            # show config file location
@@ -455,6 +461,7 @@ Environment variables (take priority over saved config):
 DEEPSEEK_API_KEY=sk-...
 DEEPSEEK_MODEL=deepseek-v4-flash
 DEEPSEEK_BASE_URL=https://api.deepseek.com
+GLM_API_KEY=your-z-ai-key
 GOOGLE_SEARCH_API_KEY=...
 GOOGLE_SEARCH_ENGINE_ID=...
 WEB_SEARCH_PROVIDER=auto

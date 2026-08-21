@@ -4,12 +4,11 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { deepSeekHttpError } from "./api-error.js";
-import { getDeepSeekApiKey } from "./config.js";
+import { getProviderApiKey } from "./config.js";
+import { normalizeProvider, providerConfig } from "./providers.js";
 import { applyThinkingOptions } from "./deepseek-request.js";
 import { isRetryableFetchError, retryBackoffMs } from "./fetch-retry.js";
 
-const DEFAULT_BASE_URL = "https://api.deepseek.com";
-const DEFAULT_MODEL = "deepseek-v4-flash";
 const DEFAULT_OUTPUT = "deepseek-result.md";
 
 function usage() {
@@ -24,8 +23,9 @@ Options:
   --prompt-file <file>      Read prompt content from a file.
   --stdin                   Read prompt content from stdin.
   -o, --output <file>       Markdown output file. Default: ${DEFAULT_OUTPUT}
-  --model <name>            DeepSeek model. Default: ${DEFAULT_MODEL}
-  --base-url <url>          OpenAI-compatible base URL. Default: ${DEFAULT_BASE_URL}
+  --provider <deepseek|glm> Model provider. Default: deepseek
+  --model <name>            Model (provider default)
+  --base-url <url>          OpenAI-compatible base URL (provider default)
   --effort <high|max>       Reasoning effort. Default: high
   --thinking <enabled|disabled>
                             DeepSeek thinking toggle. Default: enabled
@@ -42,10 +42,13 @@ Options:
 }
 
 function parseArgs(argv) {
+  const initialProvider = normalizeProvider(process.env.DSW_PROVIDER || process.env.DEEPSEEK_PROVIDER || "deepseek");
+  const initialConfig = providerConfig(initialProvider);
   const opts = {
     output: DEFAULT_OUTPUT,
-    model: process.env.DEEPSEEK_MODEL || DEFAULT_MODEL,
-    baseUrl: process.env.DEEPSEEK_BASE_URL || DEFAULT_BASE_URL,
+    provider: initialProvider,
+    model: process.env.DSW_MODEL || process.env[`${initialProvider.toUpperCase()}_MODEL`] || initialConfig.model,
+    baseUrl: process.env.DSW_BASE_URL || process.env[`${initialProvider.toUpperCase()}_BASE_URL`] || initialConfig.baseUrl,
     effort: "high",
     thinking: "enabled",
     maxTokens: 8192,
@@ -57,6 +60,8 @@ function parseArgs(argv) {
     claudeCmd: process.env.CLAUDE_CMD || "claude",
     detach: false
   };
+  let modelExplicit = false;
+  let baseUrlExplicit = false;
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -71,8 +76,13 @@ function parseArgs(argv) {
     else if (arg === "--prompt-file") opts.promptFile = next();
     else if (arg === "--stdin") opts.stdin = true;
     else if (arg === "-o" || arg === "--output") opts.output = next();
-    else if (arg === "--model") opts.model = next();
-    else if (arg === "--base-url") opts.baseUrl = next();
+    else if (arg === "--provider") {
+      opts.provider = normalizeProvider(next());
+      if (!modelExplicit) opts.model = providerConfig(opts.provider).model;
+      if (!baseUrlExplicit) opts.baseUrl = providerConfig(opts.provider).baseUrl;
+    }
+    else if (arg === "--model") { opts.model = next(); modelExplicit = true; }
+    else if (arg === "--base-url") { opts.baseUrl = next(); baseUrlExplicit = true; }
     else if (arg === "--effort") opts.effort = next();
     else if (arg === "--thinking") opts.thinking = next();
     else if (arg === "--max-tokens") opts.maxTokens = Number.parseInt(next(), 10);
@@ -135,6 +145,7 @@ function detachedArgv(opts) {
   if (opts.promptFile) args.push("--prompt-file", opts.promptFile);
   else args.push("--prompt", opts.prompt);
   args.push("--output", opts.output);
+  args.push("--provider", opts.provider);
   args.push("--model", opts.model);
   args.push("--base-url", opts.baseUrl);
   args.push("--effort", opts.effort);
@@ -162,8 +173,9 @@ async function spawnDetached(opts) {
 }
 
 async function callDeepSeek(opts, prompt) {
-  const apiKey = await getDeepSeekApiKey();
-  if (!apiKey) throw new Error("No DeepSeek API key found. Run: dsw config set-key <key>");
+  const provider = providerConfig(opts.provider);
+  const apiKey = await getProviderApiKey(opts.provider);
+  if (!apiKey) throw new Error(`No ${provider.label} API key found. Run: dsw config set-${opts.provider === "glm" ? "glm-" : ""}key <key>`);
 
   // Retry transient fetch failures (network blips, timeouts, HTTP 429/5xx)
   // with exponential backoff instead of crashing. --retry-attempts 0 keeps
@@ -192,7 +204,7 @@ async function callDeepSeek(opts, prompt) {
         status: response.status,
         statusText: response.statusText,
         headers: response.headers
-      }));
+      }), provider.label);
 
       const data = JSON.parse(text);
       const content = data?.choices?.[0]?.message?.content;

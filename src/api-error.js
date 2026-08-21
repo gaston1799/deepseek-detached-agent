@@ -1,4 +1,4 @@
-export async function deepSeekHttpError(response) {
+export async function deepSeekHttpError(response, provider = "DeepSeek") {
   const text = await response.text();
   let detail = text;
 
@@ -6,7 +6,7 @@ export async function deepSeekHttpError(response) {
     const data = JSON.parse(text);
     const error = data?.error;
     if (error?.message) {
-      const bits = [`DeepSeek HTTP ${response.status}: ${error.message}`];
+      const bits = [`${provider} HTTP ${response.status}: ${error.message}`];
       if (error.code) bits.push(`code=${error.code}`);
       if (error.type) bits.push(`type=${error.type}`);
       detail = bits.join(" ");

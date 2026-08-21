@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "profiles": {
+    "linux-general": { "image": "dsw/linux-general:latest", "cpu": 2, "memory_mb": 2048, "timeout_ms": 120000, "network": "none", "capabilities": [] },
+    "linux-re": { "image": "dsw/linux-re:latest", "cpu": 4, "memory_mb": 4096, "timeout_ms": 300000, "network": "none", "capabilities": [] },
+    "web-testing": { "image": "dsw/web-testing:latest", "cpu": 2, "memory_mb": 2048, "timeout_ms": 120000, "network": "allowlisted", "capabilities": [] },
+    "fuzzing": { "image": "dsw/fuzzing:latest", "cpu": 2, "memory_mb": 4096, "timeout_ms": 300000, "network": "none", "capabilities": [] },
+    "network-analysis": { "image": "dsw/network-analysis:latest", "cpu": 2, "memory_mb": 2048, "timeout_ms": 120000, "network": "none", "capabilities": [] },
+    "android-tools": { "image": "dsw/android-tools:latest", "cpu": 4, "memory_mb": 4096, "timeout_ms": 300000, "network": "none", "capabilities": [] }
+  }
+}

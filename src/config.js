@@ -1,6 +1,7 @@
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
+import { normalizeProvider, providerConfig } from "./providers.js";
 
 export function configPath() {
   const base = process.env.APPDATA || process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
@@ -28,15 +29,26 @@ export async function writeConfig(config) {
 }
 
 export async function getDeepSeekApiKey() {
-  if (process.env.DEEPSEEK_API_KEY) return process.env.DEEPSEEK_API_KEY;
+  return getProviderApiKey("deepseek");
+}
+
+export async function getProviderApiKey(provider) {
+  const normalized = normalizeProvider(provider);
+  const { envKey } = providerConfig(normalized);
+  if (process.env[envKey]) return process.env[envKey];
   const config = await readConfig();
-  return config.deepseekApiKey || "";
+  return config[`${normalized}ApiKey`] || "";
 }
 
 export async function setDeepSeekApiKey(apiKey) {
+  return setProviderApiKey("deepseek", apiKey);
+}
+
+export async function setProviderApiKey(provider, apiKey) {
+  const normalized = normalizeProvider(provider);
   const trimmed = apiKey.trim();
   if (!trimmed) throw new Error("API key cannot be empty.");
   const config = await readConfig();
-  config.deepseekApiKey = trimmed;
+  config[`${normalized}ApiKey`] = trimmed;
   await writeConfig(config);
 }

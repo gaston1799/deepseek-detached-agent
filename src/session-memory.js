@@ -56,10 +56,11 @@ export async function listSessions(dir = SESSION_DIR) {
   return sessions.sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""));
 }
 
-export function newSession({ model, baseUrl, workspace, systemPrompt, userPrompt, config = {} }) {
+export function newSession({ provider, model, baseUrl, workspace, systemPrompt, userPrompt, config = {} }) {
   const now = new Date().toISOString();
   return {
     version: 1,
+    provider,
     createdAt: now,
     updatedAt: now,
     model,

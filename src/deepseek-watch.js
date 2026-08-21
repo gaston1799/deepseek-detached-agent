@@ -8,7 +8,8 @@ import { clearLine, createInterface, cursorTo } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { deepSeekHttpError } from "./api-error.js";
 import { isRetryableFetchError, retryBackoffMs } from "./fetch-retry.js";
-import { configPath, getDeepSeekApiKey, setDeepSeekApiKey } from "./config.js";
+import { configPath, getDeepSeekApiKey, getProviderApiKey, setProviderApiKey } from "./config.js";
+import { contextLimitFor, normalizeProvider, providerConfig } from "./providers.js";
 import { applyThinkingOptions } from "./deepseek-request.js";
 import { listSessions, newSession, newSessionPath, readSession, sessionPath, touchSession, writeSession } from "./session-memory.js";
 import { certLogs, classifyUrl, dnsLookup, fileAnalyze, trackSafetyState, verifyDownload, virusTotalLookup, watchDownloads, whoisLookup } from "./download-safety.js";
@@ -33,9 +34,14 @@ import {
   waitForAgentMessages
 } from "./agent-coordination.js";
 import { discoverSkills, formatSkillList, renderLoadedSkills, resolveSkill, runSkillCommand, skillRootsWithSources, skillUsage } from "./skills.js";
+import { boundedSearch } from "./search.js";
+import { getArtifact, listArtifacts, readArtifactRange, searchArtifact, writeArtifact } from "./artifacts.js";
+import { SANDBOX_ENVIRONMENTS, sandboxExecute, sandboxOperation } from "./sandbox.js";
+import { checkScope, getScope, recordHypothesis, recordRoi, recordViability, setScope } from "./task-state.js";
+import { netConversations, netExtractFields, netListInterfaces, netProtocolSummary, netQueryPcap, netStreamSummary } from "./net-tools.js";
+import { peTriage } from "./triage.js";
 
-const DEFAULT_BASE_URL = "https://api.deepseek.com";
-const DEFAULT_MODEL = "deepseek-v4-flash";
+const DEFAULT_PROVIDER = "deepseek";
 // __SYSTEM_PROMPT__ is replaced with the file's content by the exe build step (esbuild --define).
 // In normal dev/npm installs it is undefined and the file is read at runtime instead.
 const EMBEDDED_SYSTEM_PROMPT = typeof __SYSTEM_PROMPT__ !== "undefined" ? __SYSTEM_PROMPT__ : null;
@@ -66,6 +72,7 @@ Usage:
   dsw skill sync [--from-workspace|--to-workspace] [--force] [--migrate-from-codex]
   dsw skill doctor
   dsw config set-key <key>
+  dsw config set-glm-key <key>
   dsw config set-openai-key <key>
   dsw config set-google-search-key <key>
   dsw config set-google-search-engine-id <engine-id>
@@ -89,8 +96,9 @@ Options:
   --skill-root <dir>           Directory containing skill folders. Repeatable.
   --list-skills                List discovered local skills and exit.
   --skill-root also selects the canonical DeepSeek root for dsw skill install/create/remove/sync.
-  --model <name>               DeepSeek model. Default: deepseek-v4-flash
-  --base-url <url>             OpenAI-compatible base URL. Default: https://api.deepseek.com
+  --provider <deepseek|glm>    Model provider. Default: deepseek
+  --model <name>               Model (provider default: deepseek-v4-flash or glm-4.7)
+  --base-url <url>             OpenAI-compatible base URL (provider default)
   --effort <high|max>          Reasoning effort. Default: high
   --thinking <enabled|disabled>
                                DeepSeek thinking toggle. Default: enabled
@@ -110,6 +118,7 @@ Options:
   --agent-id <id>              Stable coordination identity. Default: generated and saved in the session.
   --agent-role <role>          Agent role, such as coordinator or worker. Default: worker
   --agent-mission <text>       Current mission shown to other agents.
+  --coordinator-id <id>        Known coordinator to contact first (or DEEPSEEK_COORDINATOR_ID).
   --coord-dir <dir>            Shared coordination directory. Default: .deepseek-watch/coordination
   --no-save-session            Do not write session memory to disk.
   -o, --output <file>          Write a Markdown result file.
@@ -123,7 +132,7 @@ Options:
   --tui-quiet                  Clean-copy mode: no status line, no in-place line rewriting (text streams line-by-line).
   --compact-at <pct>           Auto-compact when estimated context hits this fraction of the limit. Default: 0.9
   --compact-method <method>    auto|llm|truncate|detached|off. Default: auto (LLM summary, truncate fallback on error)
-  --compact-limit <tokens>     Total context window used for compaction math. Default: 1048576
+  --compact-limit <tokens|auto> Total context window; auto follows provider/model. Default: auto
   --compact-keep-recent <n>    Messages kept verbatim after compaction. Default: 40
   --no-compact                 Disable automatic context compaction (alias for --compact-method off).
   -h, --help                   Show help.
@@ -131,9 +140,12 @@ Options:
 }
 
 function parseArgs(argv) {
+  const initialProvider = normalizeProvider(process.env.DSW_PROVIDER || process.env.DEEPSEEK_PROVIDER || DEFAULT_PROVIDER);
+  const initialConfig = providerConfig(initialProvider);
   const opts = {
-    model: process.env.DEEPSEEK_MODEL || DEFAULT_MODEL,
-    baseUrl: process.env.DEEPSEEK_BASE_URL || DEFAULT_BASE_URL,
+    provider: initialProvider,
+    model: process.env.DSW_MODEL || process.env[`${initialProvider.toUpperCase()}_MODEL`] || initialConfig.model,
+    baseUrl: process.env.DSW_BASE_URL || process.env[`${initialProvider.toUpperCase()}_BASE_URL`] || initialConfig.baseUrl,
     effort: "high",
     thinking: "enabled",
     maxTokens: 16384,
@@ -162,12 +174,17 @@ function parseArgs(argv) {
     agentId: process.env.DEEPSEEK_AGENT_ID || null,
     agentRole: process.env.DEEPSEEK_AGENT_ROLE || null,
     agentMission: process.env.DEEPSEEK_AGENT_MISSION || "",
+    coordinatorId: process.env.DEEPSEEK_COORDINATOR_ID || null,
     coordDir: process.env.DEEPSEEK_COORD_DIR || null,
     compactAt: Number.parseFloat(process.env.DEEPSEEK_COMPACT_AT || "0.9"),
     compactMethod: process.env.DEEPSEEK_COMPACT_METHOD || "auto",
-    contextLimit: Number.parseInt(process.env.DEEPSEEK_CONTEXT_LIMIT || "1048576", 10),
+    contextLimit: process.env.DEEPSEEK_CONTEXT_LIMIT ? Number.parseInt(process.env.DEEPSEEK_CONTEXT_LIMIT, 10) : null,
     compactKeepRecent: Number.parseInt(process.env.DEEPSEEK_COMPACT_KEEP_RECENT || "40", 10)
   };
+  let modelExplicit = false;
+  let baseUrlExplicit = false;
+  opts.modelExplicit = false;
+  opts.baseUrlExplicit = false;
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -188,8 +205,13 @@ function parseArgs(argv) {
     else if (arg === "--skills") opts.skills.push(...next().split(",").map((item) => item.trim()).filter(Boolean));
     else if (arg === "--skill-root") opts.skillRoots.push(next());
     else if (arg === "--list-skills") opts.listSkills = true;
-    else if (arg === "--model") opts.model = next();
-    else if (arg === "--base-url") opts.baseUrl = next();
+    else if (arg === "--provider") {
+      opts.provider = normalizeProvider(next());
+      if (!modelExplicit) opts.model = providerConfig(opts.provider).model;
+      if (!baseUrlExplicit) opts.baseUrl = providerConfig(opts.provider).baseUrl;
+    }
+    else if (arg === "--model") { opts.model = next(); modelExplicit = true; opts.modelExplicit = true; }
+    else if (arg === "--base-url") { opts.baseUrl = next(); baseUrlExplicit = true; opts.baseUrlExplicit = true; }
     else if (arg === "--effort") opts.effort = next();
     else if (arg === "--thinking") opts.thinking = next();
     else if (arg === "--max-tokens") opts.maxTokens = Number.parseInt(next(), 10);
@@ -209,6 +231,7 @@ function parseArgs(argv) {
     else if (arg === "--agent-id") opts.agentId = next();
     else if (arg === "--agent-role") opts.agentRole = next();
     else if (arg === "--agent-mission") opts.agentMission = next();
+    else if (arg === "--coordinator-id") opts.coordinatorId = next();
     else if (arg === "--coord-dir") opts.coordDir = next();
     else if (arg === "--no-save-session") opts.saveSession = false;
     else if (arg === "-o" || arg === "--output" || arg === "--outfile") opts.output = next();
@@ -220,7 +243,10 @@ function parseArgs(argv) {
     else if (arg === "--tui-quiet") opts.tuiQuiet = true;
     else if (arg === "--compact-at") opts.compactAt = Number.parseFloat(next());
     else if (arg === "--compact-method") opts.compactMethod = next();
-    else if (arg === "--compact-limit") opts.contextLimit = Number.parseInt(next(), 10);
+    else if (arg === "--compact-limit") {
+      const value = next();
+      opts.contextLimit = value.toLowerCase() === "auto" ? null : Number.parseInt(value, 10);
+    }
     else if (arg === "--compact-keep-recent") opts.compactKeepRecent = Number.parseInt(next(), 10);
     else if (arg === "--no-compact") opts.compactMethod = "off";
     else throw new Error(`Unknown argument: ${arg}`);
@@ -232,7 +258,10 @@ function parseArgs(argv) {
 function validateOpts(opts) {
   if (opts.help || opts.printSystem || opts.listSkills) return;
   const promptSources = [opts.prompt, opts.promptFile, opts.stdin].filter(Boolean).length;
-  if (promptSources === 0) throw new Error("Provide --prompt, --prompt-file, or --stdin.");
+  if (promptSources === 0) {
+    if (!process.stdin.isTTY) throw new Error("Provide --prompt, --prompt-file, or --stdin when stdin is not interactive.");
+    opts.interactiveChat = true;
+  }
   if (promptSources > 1) throw new Error("Use only one prompt source.");
   if (!["enabled", "disabled"].includes(opts.thinking)) throw new Error("--thinking must be enabled or disabled.");
   if (!["high", "max"].includes(opts.effort)) throw new Error("--effort must be high or max.");
@@ -249,7 +278,7 @@ function validateOpts(opts) {
   if (!Number.isFinite(opts.compactAt) || opts.compactAt <= 0 || opts.compactAt > 1) throw new Error("--compact-at must be a fraction in (0, 1].");
   if (!["auto", "llm", "truncate", "detached", "off"].includes(opts.compactMethod)) throw new Error("--compact-method must be auto, llm, truncate, detached, or off.");
   if (!Number.isInteger(opts.compactKeepRecent) || opts.compactKeepRecent < 2) throw new Error("--compact-keep-recent must be an integer >= 2.");
-  if (!Number.isFinite(opts.contextLimit) || opts.contextLimit < 2000) throw new Error("--compact-limit must be at least 2000 tokens.");
+  if (opts.contextLimit !== null && (!Number.isFinite(opts.contextLimit) || opts.contextLimit < 2000)) throw new Error("--compact-limit must be auto or at least 2000 tokens.");
 }
 
 function readStdin() {
@@ -265,6 +294,11 @@ function readStdin() {
 async function loadPrompt(opts) {
   if (opts.promptFile) return readFile(resolve(opts.promptFile), "utf8");
   if (opts.stdin) return readStdin();
+  if (opts.interactiveChat && !opts.prompt) {
+    const prompt = await promptLine("Prompt> ");
+    if (!prompt.trim()) opts.quit = true;
+    return prompt;
+  }
   return opts.prompt;
 }
 
@@ -329,8 +363,10 @@ function agentIdentityContext(opts) {
     `agent_id: ${opts.agentId}`,
     `agent_role: ${opts.agentRole || "worker"}`,
     `agent_mission: ${opts.agentMission || "(not assigned)"}`,
+    `coordinator_id: ${opts.coordinatorId || "(unknown)"}`,
+    `context_limit: ${opts.contextLimit || "auto"}`,
     `coordination_directory: ${opts.coordDir || "(not initialized)"}`,
-    "Use agent_list to discover peers and their missions, agent_send to communicate, agent_task_list/agent_claim for bounded work, agent_handoff for results, and agent_wait only when you are ready to park until a message arrives. Treat scopes claimed by other agents as read-only unless they explicitly hand them off."
+    "At the start of a worker session, announce yourself and your mission to coordinator_id with agent_send (type=status) before other coordination discovery. Do not call agent_list merely to announce when coordinator_id is known. If coordinator_id is unknown, use agent_list once to find the coordinator, then send the direct announcement. Use agent_task_list/agent_claim for bounded work, agent_handoff for results, and agent_wait only when you are ready to park until a message arrives. Treat scopes claimed by other agents as read-only unless they explicitly hand them off."
   ].join("\n");
 }
 
@@ -1861,11 +1897,153 @@ function toolSchemas(opts) {
             ignore_case:      { type: "boolean", description: "Case-insensitive match. Default false." },
             max_results:      { type: "number",  description: "Max matches to return. Default 200." },
             context_lines:    { type: "number",  description: "Lines of surrounding context per match (0–5). Default 0." },
+            max_matches:      { type: "number",  description: "Hard maximum matches. Default 200, max 2000." },
+            max_result_chars: { type: "number",  description: "Hard maximum characters per match result. Default 1200." },
+            max_total_chars:  { type: "number",  description: "Hard maximum characters returned by this call. Default 24000." },
+            context_chars:    { type: "number",  description: "Characters around each match. Default 160." },
+            regex_timeout_ms: { type: "number",  description: "Regex worker timeout per file. Default 750ms." },
+            page_token:       { type: "string",  description: "Continuation token from a previous search." },
             respect_gitignore:{ type: "boolean", description: "Apply default excludes (.git, node_modules, dist, …). Default true." }
           },
           required: ["pattern"],
           additionalProperties: false
         }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "artifact_list",
+        description: "List bounded analysis artifacts for this task.",
+        parameters: { type: "object", properties: {}, additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "artifact_read_range",
+        description: "Read a bounded character/byte range from a saved artifact.",
+        parameters: { type: "object", properties: { artifact: { type: "string" }, offset: { type: "number" }, max_bytes: { type: "number" } }, required: ["artifact"], additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "artifact_search",
+        description: "Search a saved artifact and return bounded snippets around matches.",
+        parameters: { type: "object", properties: { artifact: { type: "string" }, pattern: { type: "string" }, max_matches: { type: "number" }, context_chars: { type: "number" } }, required: ["artifact", "pattern"], additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "sandbox_execute",
+        description: "Execute a bounded command in a named ephemeral Docker environment. Output is capped and stored as an artifact.",
+        parameters: { type: "object", properties: { environment: { type: "string", enum: Object.keys(SANDBOX_ENVIRONMENTS) }, command: { type: "string" }, timeout_ms: { type: "number" }, working_directory: { type: "string" }, cpu: { type: "number" }, memory_mb: { type: "number" }, network_policy: { type: "string", enum: ["none", "allowlisted"] }, persistence: { type: "string", enum: ["ephemeral", "persistent"] }, env: { type: "object" } }, required: ["environment", "command"], additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "sandbox_manage",
+        description: "Create, inspect, execute, copy, retrieve logs, stop, destroy, or list Docker sandbox environments/containers.",
+        parameters: { type: "object", properties: { operation: { type: "string", enum: ["create", "exec", "copy_in", "copy_out", "inspect", "logs", "stop", "destroy", "list_environments", "list_containers"] }, environment: { type: "string", enum: Object.keys(SANDBOX_ENVIRONMENTS) }, container: { type: "string" }, command: { type: "string" }, source: { type: "string" }, destination: { type: "string" }, timeout_ms: { type: "number" } }, required: ["operation"], additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "scope_get",
+        description: "Read the current task authorization scope and restrictions.",
+        parameters: { type: "object", properties: {}, additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "scope_set",
+        description: "Set reviewed task scope state. Network/target tools must consult this state.",
+        parameters: { type: "object", properties: { allowed_assets: { type: "array", items: { type: "string" } }, excluded_assets: { type: "array", items: { type: "string" } }, allowed_classes: { type: "array", items: { type: "string" } }, excluded_classes: { type: "array", items: { type: "string" } }, restrictions: { type: "array", items: { type: "string" } }, source_artifact: { type: "string" } }, additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "scope_check",
+        description: "Check whether a target and vulnerability class are in the task scope.",
+        parameters: { type: "object", properties: { target: { type: "string" }, vulnerability_class: { type: "string" } }, required: ["target"], additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "hypothesis_record",
+        description: "Persist a tested hypothesis, evidence, outcome, rejection reason, and artifact references.",
+        parameters: { type: "object", properties: { hypothesis: { type: "string" }, evidence: { type: "string" }, test: { type: "string" }, outcome: { type: "string" }, rejected_reason: { type: "string" }, artifacts: { type: "array", items: { type: "string" } } }, required: ["hypothesis", "test", "outcome"], additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "viability_set",
+        description: "Record the target viability decision: CONTINUE, ESCALATE, or DROP.",
+        parameters: { type: "object", properties: { decision: { type: "string", enum: ["CONTINUE", "ESCALATE", "DROP"] }, factors: { type: "object" }, notes: { type: "string" } }, required: ["decision"], additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "roi_record",
+        description: "Record model/tool/runtime/cost/result economics for the current task.",
+        parameters: { type: "object", properties: { model: { type: "string" }, input_tokens: { type: "number" }, output_tokens: { type: "number" }, api_cost: { type: "number" }, runtime_ms: { type: "number" }, workers: { type: "number" }, result: { type: "string" }, severity: { type: "string" }, bounty: { type: "number" } }, additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "pe_triage",
+        description: "Perform bounded first-pass PE triage and route indicators to specialist analysis.",
+        parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"], additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "net_list_interfaces",
+        description: "List capture interfaces inside the network-analysis environment.",
+        parameters: { type: "object", properties: {}, additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "net_protocol_summary",
+        description: "Return a bounded protocol summary from an indexed PCAP artifact.",
+        parameters: { type: "object", properties: { artifact: { type: "string" } }, required: ["artifact"], additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "net_conversations",
+        description: "Return bounded network conversations from a PCAP artifact.",
+        parameters: { type: "object", properties: { artifact: { type: "string" } }, required: ["artifact"], additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "net_query_pcap",
+        description: "Run a bounded display-filter/field query against a PCAP artifact.",
+        parameters: { type: "object", properties: { artifact: { type: "string" }, filter: { type: "string" }, fields: { type: "array", items: { type: "string" } } }, required: ["artifact"], additionalProperties: false }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "net_stream_summary",
+        description: "Return bounded TCP stream/conversation summaries from a PCAP artifact.",
+        parameters: { type: "object", properties: { artifact: { type: "string" } }, required: ["artifact"], additionalProperties: false }
       }
     },
     {
@@ -3143,6 +3321,8 @@ async function doctor() {
     `Workspace: ${process.cwd()}`,
     `Node: ${process.version}`,
     `Config path: ${configPath()}`,
+    `DeepSeek API key: ${deepSeekKey ? "configured" : "not_configured"}`,
+    `GLM API key: ${(await getProviderApiKey("glm")) ? "configured" : "not_configured"}`,
     "",
     "DeepSeek",
     `  API key: ${deepSeekKey ? maskedSecretStatus(deepSeekKey) : "not set"}`,
@@ -3873,6 +4053,44 @@ function patchEolTolerant(content, oldString, newString, { replaceAll = false } 
     return maybeRunShellTool(opts, "powershell", args.command, args.timeout_ms ?? 120000, cwd);
   }
 
+  if (name === "artifact_list") return jsonResult(await listArtifacts({ cwd: process.cwd(), taskId: opts.agentId || opts.session }));
+  if (name === "artifact_read_range") return jsonResult(await readArtifactRange({ cwd: process.cwd(), taskId: opts.agentId || opts.session, artifact: args.artifact, offset: args.offset, maxBytes: args.max_bytes }));
+  if (name === "artifact_search") return jsonResult(await searchArtifact({ cwd: process.cwd(), taskId: opts.agentId || opts.session, artifact: args.artifact, pattern: args.pattern, maxMatches: args.max_matches, contextChars: args.context_chars }));
+  if (name === "pe_triage") return jsonResult(await peTriage({ cwd: process.cwd(), taskId: opts.agentId || opts.session, path: args.path }));
+  if (name === "net_list_interfaces") return jsonResult(await netListInterfaces({ cwd: process.cwd(), taskId: opts.agentId || opts.session }));
+  if (name === "net_protocol_summary") return jsonResult(await netProtocolSummary({ cwd: process.cwd(), taskId: opts.agentId || opts.session, artifact: args.artifact }));
+  if (name === "net_conversations") return jsonResult(await netConversations({ cwd: process.cwd(), taskId: opts.agentId || opts.session, artifact: args.artifact }));
+  if (name === "net_query_pcap") return jsonResult(await netQueryPcap({ cwd: process.cwd(), taskId: opts.agentId || opts.session, artifact: args.artifact, filter: args.filter, fields: args.fields }));
+  if (name === "net_stream_summary") return jsonResult(await netStreamSummary({ cwd: process.cwd(), taskId: opts.agentId || opts.session, artifact: args.artifact }));
+  if (name === "sandbox_execute") return jsonResult(await sandboxExecute({ cwd: process.cwd(), taskId: opts.agentId || opts.session, environment: args.environment, command: args.command, timeoutMs: args.timeout_ms, workingDirectory: args.working_directory, cpu: args.cpu, memoryMb: args.memory_mb, networkPolicy: args.network_policy, persistence: args.persistence, env: args.env }));
+  if (name === "sandbox_manage") return jsonResult(await sandboxOperation({ cwd: process.cwd(), taskId: opts.agentId || opts.session, ...args }));
+  const taskKey = opts.agentId || opts.session;
+  if (name === "scope_get") return jsonResult(await getScope(process.cwd(), taskKey));
+  if (name === "scope_check") return jsonResult(await checkScope(process.cwd(), taskKey, args.target, args.vulnerability_class));
+  if (["scope_set", "hypothesis_record", "viability_set", "roi_record"].includes(name) && opts.permission === "review") return "blocked by session permission: review only";
+  if (name === "scope_set") return jsonResult(await setScope(process.cwd(), taskKey, args));
+  if (name === "hypothesis_record") return jsonResult(await recordHypothesis(process.cwd(), taskKey, args));
+  if (name === "viability_set") return jsonResult(await recordViability(process.cwd(), taskKey, args));
+  if (name === "roi_record") return jsonResult(await recordRoi(process.cwd(), taskKey, args));
+
+  if (name === "search_code") {
+    return jsonResult(await boundedSearch({
+      cwd: process.cwd(),
+      taskId: opts.agentId || opts.session,
+      pattern: args.pattern,
+      path: args.path,
+      glob: args.glob,
+      ignoreCase: args.ignore_case,
+      maxMatches: args.max_matches ?? args.max_results,
+      maxResultChars: args.max_result_chars,
+      maxTotalChars: args.max_total_chars,
+      contextChars: args.context_chars,
+      regexTimeoutMs: args.regex_timeout_ms,
+      pageToken: args.page_token,
+      allowExternal: opts.permission === "full"
+    }));
+  }
+
   if (name === "search_code") {
     const pattern = String(args.pattern || "");
     if (!pattern) throw new Error("pattern is required");
@@ -4141,6 +4359,14 @@ function patchEolTolerant(content, oldString, newString, { replaceAll = false } 
   }
 
   if (name.startsWith("sec_")) {
+    const target = args.url || args.domain || args.host || "";
+    if (target) {
+      const scope = await getScope(process.cwd(), opts.agentId || opts.session);
+      if (scope.allowed_assets.length || scope.excluded_assets.length) {
+        const decision = await checkScope(process.cwd(), opts.agentId || opts.session, target, args.vulnerability_class);
+        if (!decision.allowed) throw new Error(`Target blocked by task scope: ${decision.reason}`);
+      }
+    }
     return runSecurityTool(name, args, { ...opts, askYesNo });
   }
 
@@ -4256,8 +4482,9 @@ function installStreamInterruptHandler(opts, controller) {
 }
 
 async function streamChat(opts, messages, toolsEnabled = opts.tools) {
-  const apiKey = await getDeepSeekApiKey();
-  if (!apiKey) throw new Error("No DeepSeek API key found. Run: dsw config set-key <key>");
+  const apiKey = await getProviderApiKey(opts.provider);
+  const provider = providerConfig(opts.provider);
+  if (!apiKey) throw new Error(`No ${provider.label} API key found. Run: dsw config set-${opts.provider === "glm" ? "glm-" : ""}key <key>`);
 
   // One attempt per iteration. Transient failures (network blips, per-attempt
   // timeouts, HTTP 429/5xx) retry with exponential backoff instead of taking
@@ -4304,7 +4531,7 @@ async function streamChat(opts, messages, toolsEnabled = opts.tools) {
         body: JSON.stringify(body)
       });
 
-      if (!response.ok) throw await deepSeekHttpError(response);
+      if (!response.ok) throw await deepSeekHttpError(response, provider.label);
       const decoder = new TextDecoder();
       let buffer = "";
 
@@ -4511,13 +4738,15 @@ async function spawnSwarmAgent(opts, args, { resume }) {
     script,
     "--agent-id", agentId,
     "--agent-role", role,
+    "--coordinator-id", opts.agentId,
     ...(mission ? ["--agent-mission", mission] : []),
+    "--provider", opts.provider,
     "--model", model,
     "--coord-dir", coordDir,
     "--permission", permission,
     "--compact-method", "auto",
     "--compact-at", "0.9",
-    "--compact-limit", "1048576",
+    "--compact-limit", String(opts.contextLimit || contextLimitFor(opts.provider, model)),
     "-p", prompt
   ];
   const child = spawn(nodeExe, workerArgs, { detached: true, stdio: "ignore", windowsHide: true });
@@ -5105,9 +5334,10 @@ async function run() {
 
   if (argv[0] === "config") {
     const command = argv[1];
-    if (command === "set-key") {
-      await setDeepSeekApiKey(argv[2] || "");
-      process.stdout.write(`Saved DeepSeek API key to ${configPath()}\n`);
+    if (command === "set-key" || command === "set-glm-key") {
+      const provider = command === "set-glm-key" ? "glm" : "deepseek";
+      await setProviderApiKey(provider, argv[2] || "");
+      process.stdout.write(`Saved ${providerConfig(provider).label} API key to ${configPath()}\n`);
       return;
     }
     if (command === "set-openai-key") {
@@ -5126,7 +5356,7 @@ async function run() {
       process.stdout.write(`${configPath()}\n`);
       return;
     }
-    throw new Error("Unknown config command. Use: dsw config set-key <key>, dsw config set-openai-key <key>, dsw config set-google-search-key <key>, or dsw config set-google-search-engine-id <engine-id>");
+    throw new Error("Unknown config command. Use: dsw config set-key <key>, dsw config set-glm-key <key>, dsw config set-openai-key <key>, dsw config set-google-search-key <key>, or dsw config set-google-search-engine-id <engine-id>");
   }
 
   const opts = argv.length === 0 ? await dashboardOpts() : parseArgs(argv);
@@ -5182,6 +5412,10 @@ async function run() {
   }
   if (opts.resume || autoAgentSession) {
     resumedSession = await readSession(opts.session);
+    if (resumedSession.config?.provider) opts.provider = normalizeProvider(resumedSession.config.provider);
+    if (!opts.coordinatorId && resumedSession.config?.coordinatorId) opts.coordinatorId = resumedSession.config.coordinatorId;
+    if (!opts.modelExplicit && resumedSession.model) opts.model = resumedSession.model;
+    if (!opts.baseUrlExplicit && resumedSession.baseUrl) opts.baseUrl = resumedSession.baseUrl;
     if (!opts.skills.length && Array.isArray(resumedSession.config?.skills)) {
       opts.skills = normalizeList(resumedSession.config.skills);
     }
@@ -5194,6 +5428,7 @@ async function run() {
   opts.agentMission = String(opts.agentMission || resumedSession?.config?.agentMission || "").trim();
   opts.agentId = validateAgentId(opts.agentId || resumedSession?.config?.agentId || generateAgentId(opts.agentRole));
   opts.coordDir = coordinationRoot(opts.coordDir || resumedSession?.config?.coordDir);
+  if (opts.contextLimit === null) opts.contextLimit = contextLimitFor(opts.provider, opts.model);
 
   opts.skills = normalizeList(opts.skills);
   opts.skillRoots = normalizeList(opts.skillRoots);
@@ -5205,6 +5440,7 @@ async function run() {
   }
 
   const userPrompt = await loadPrompt(opts);
+  if (opts.quit) return;
   if (!opts.session) {
     opts.session = newSessionPath();
   }
@@ -5212,6 +5448,7 @@ async function run() {
   const session = (opts.resume || autoAgentSession)
     ? resumedSession
     : newSession({
+      provider: opts.provider,
       model: opts.model,
       baseUrl: opts.baseUrl,
       workspace: process.cwd(),
@@ -5221,7 +5458,8 @@ async function run() {
         permission: opts.permission || (opts.dangerouslyAutoRunCommands ? "full" : "ask"),
         toolMode: opts.toolMode,
         skills: opts.skills,
-        skillRoots: opts.skillRoots
+        skillRoots: opts.skillRoots,
+        coordinatorId: opts.coordinatorId
       }
     });
 
@@ -5242,6 +5480,7 @@ async function run() {
   if (opts.permission === "full") opts.dangerouslyAutoRunCommands = true;
   session.config = {
     ...(session.config || {}),
+    provider: opts.provider,
     permission: opts.permission,
     toolMode: opts.toolMode,
     skills: opts.skills,
@@ -5249,7 +5488,8 @@ async function run() {
     agentId: opts.agentId,
     agentRole: opts.agentRole,
     agentMission: opts.agentMission,
-    coordDir: opts.coordDir
+    coordDir: opts.coordDir,
+    coordinatorId: opts.coordinatorId
   };
   opts.touchedFiles = new Set(session.touchedFiles || []);
   opts.sessionCache = { ...(session.cache || {}) };
