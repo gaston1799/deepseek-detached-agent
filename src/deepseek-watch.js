@@ -14,6 +14,11 @@ import { applyThinkingOptions } from "./deepseek-request.js";
 import { listSessions, newSession, newSessionPath, readSession, sessionPath, touchSession, writeSession } from "./session-memory.js";
 import { certLogs, classifyUrl, dnsLookup, fileAnalyze, trackSafetyState, verifyDownload, virusTotalLookup, watchDownloads, whoisLookup } from "./download-safety.js";
 import { runSecurityTool, securityToolSchemas } from "./security_tools.js";
+import { runOffensiveTool, offensiveToolSchemas } from "./offensive_tools.js";
+import { runReTool, reToolSchemas } from "./re_tools.js";
+import { runRuntimeTool, runtimeToolSchemas } from "./runtime_tools.js";
+import { runFuzzTool, fuzzToolSchemas } from "./fuzz_tools.js";
+import { runBountyTool, bountyToolSchemas } from "./bounty_tools.js";
 import { createMarkdownWriter, formatDuration, ToolCallTracker } from "./tui.js";
 import { renderChatHistory, historyTitle } from "./history.js";
 import { compactSession, compactSessionDetached, estimateContextTokens, estimateMessageTokens, estimateTokens } from "./context-compactor.js";
@@ -2354,6 +2359,11 @@ function toolSchemas(opts) {
   const reviewSchemaCount = schemas.length;
 
   schemas.push(...securityToolSchemas());
+  schemas.push(...offensiveToolSchemas());
+  schemas.push(...reToolSchemas());
+  schemas.push(...runtimeToolSchemas());
+  schemas.push(...fuzzToolSchemas());
+  schemas.push(...bountyToolSchemas());
 
   schemas.push(
     {
@@ -4107,13 +4117,18 @@ function normIncludes(content, needle) {
 
 function patchEolTolerant(content, oldString, newString, { replaceAll = false } = {}) {
   newString = String(newString == null ? "" : newString);
-  // Fast path: byte-exact match (respects the documented behavior).
+  // NOTE: split/join for the literal path — String.replace() interprets
+  // dollar-special sequences (dollar-quote, dollar-backtick, dollar-amp,
+  // dollar-dollar, dollar-digit) inside the REPLACEMENT as special patterns,
+  // which silently corrupts patches containing those sequences (e.g.
+  // PowerShell dollar-quote syntax). split/join is literal.
+  const literalReplace = (haystack, needle, replacement) => {
+    const parts = haystack.split(needle);
+    if (parts.length === 1) return null;
+    return { content: parts.join(replacement), count: parts.length - 1 };
+  };
   if (content.includes(oldString)) {
-    if (replaceAll) {
-      const parts = content.split(oldString);
-      return { content: parts.join(newString), count: parts.length - 1 };
-    }
-    return { content: content.replace(oldString, newString), count: 1 };
+    return literalReplace(content, oldString, newString) || { content, count: 0 };
   }
   // CRLF/LF tolerant fallback: match on normalized text, splice the original.
   const fileEol = detectEol(content);
@@ -4503,6 +4518,40 @@ function patchEolTolerant(content, oldString, newString, { replaceAll = false } 
     const target = args.url || args.domain || args.host || "";
     if (target) await requireScope(process.cwd(), taskKey, target, args.vulnerability_class);
     return runSecurityTool(name, args, { ...opts, askYesNo });
+  }
+
+  if (name.startsWith("atk_")) {
+    const target = args.url || args.jwt || "";
+    if (target && !args.jwt) await requireScope(process.cwd(), taskKey, target, args.vulnerability_class);
+    return runOffensiveTool(name, args, { ...opts, askYesNo });
+  }
+
+  if (name.startsWith("re_")) {
+    for (const key of ["path", "before", "after"]) {
+      if (args[key]) assertInsideWorkspace(args[key]);
+    }
+    return runReTool(name, args, { ...opts, askYesNo }, { cwd: process.cwd(), taskId: taskKey });
+  }
+
+  if (name.startsWith("sys_") || name === "re_frida") {
+    if (args.path) assertInsideWorkspace(args.path);
+    return runRuntimeTool(name, args, { ...opts, askYesNo }, { cwd: process.cwd(), taskId: taskKey });
+  }
+
+  if (name === "net_mitm") {
+    if (args.url) await requireScope(process.cwd(), taskKey, args.url, args.vulnerability_class);
+    return runRuntimeTool(name, args, { ...opts, askYesNo }, { cwd: process.cwd(), taskId: taskKey });
+  }
+
+  if (name.startsWith("fz_")) {
+    for (const key of ["source", "seed_file", "seeds_dir", "crash", "crashes_dir"]) {
+      if (args[key]) assertInsideWorkspace(args[key]);
+    }
+    return runFuzzTool(name, args, { ...opts, askYesNo }, { cwd: process.cwd(), taskId: taskKey });
+  }
+
+  if (name.startsWith("h1_") || name.startsWith("bounty_") || name === "docker_cleanup") {
+    return runBountyTool(name, args, { ...opts, askYesNo }, { cwd: process.cwd(), taskId: taskKey });
   }
 
   throw new Error(`Unknown tool: ${name}`);

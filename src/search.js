@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
-import { isAbsolute, relative, resolve } from "node:path";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { Worker } from "node:worker_threads";
 import { writeArtifact } from "./artifacts.js";
 
@@ -10,6 +10,9 @@ const DEFAULT_RESULT_CHARS = 1200;
 const DEFAULT_TOTAL_CHARS = 24000;
 const DEFAULT_REGEX_TIMEOUT = 750;
 const MAX_FILE_BYTES = 100 * 1024 * 1024;
+const DEFAULT_MAX_CANDIDATE_FILES = 5000;
+const DEFAULT_TRAVERSAL_TIMEOUT = 3000;
+const DEFAULT_SEARCH_TIMEOUT = 10000;
 
 function globToRegex(pattern) {
   let out = "";
@@ -80,13 +83,30 @@ function regexMatches(text, pattern, flags, max, timeoutMs) {
   });
 }
 
-async function collectFiles(root, target, glob, excludes) {
+function isFilesystemRoot(path) {
+  const normalized = resolve(path);
+  return dirname(normalized) === normalized;
+}
+
+async function collectFiles(root, target, glob, excludes, { maxFiles, timeoutMs }) {
   const info = await stat(target);
-  if (info.isFile()) return [{ absPath: target, relPath: relative(root, target).replaceAll("\\", "/") }];
+  if (info.isFile()) return { files: [{ absPath: target, relPath: relative(root, target).replaceAll("\\", "/") }], truncated: false, visitedEntries: 1, reason: null };
   const entries = [];
+  const startedAt = Date.now();
+  let visitedEntries = 0;
+  let truncated = false;
+  let reason = null;
   async function visit(dir) {
+    if (truncated) return;
+    if (Date.now() - startedAt >= timeoutMs) { truncated = true; reason = "traversal_timeout"; return; }
     const { readdir } = await import("node:fs/promises");
-    for (const item of await readdir(dir, { withFileTypes: true })) {
+    let children;
+    try { children = await readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const item of children) {
+      if (truncated) return;
+      visitedEntries += 1;
+      if (visitedEntries > maxFiles) { truncated = true; reason = "candidate_file_limit"; return; }
+      if (Date.now() - startedAt >= timeoutMs) { truncated = true; reason = "traversal_timeout"; return; }
       if (item.isDirectory() && !excludes.has(item.name)) await visit(resolve(dir, item.name));
       else if (item.isFile()) {
         const absPath = resolve(dir, item.name);
@@ -96,21 +116,28 @@ async function collectFiles(root, target, glob, excludes) {
     }
   }
   await visit(target);
-  return entries;
+  return { files: entries, truncated, visitedEntries, reason };
 }
 
-export async function boundedSearch({ cwd = process.cwd(), taskId, pattern, path = ".", glob, ignoreCase = false, maxMatches = DEFAULT_MAX_MATCHES, maxResultChars = DEFAULT_RESULT_CHARS, maxTotalChars = DEFAULT_TOTAL_CHARS, contextChars = 160, regexTimeoutMs = DEFAULT_REGEX_TIMEOUT, pageToken, allowExternal = false, excludes = [".git", ".deepseek-watch", "node_modules", "dist", "build", "out", ".next", ".cache", "coverage"] }) {
+export async function boundedSearch({ cwd = process.cwd(), taskId, pattern, path = ".", glob, ignoreCase = false, maxMatches = DEFAULT_MAX_MATCHES, maxResultChars = DEFAULT_RESULT_CHARS, maxTotalChars = DEFAULT_TOTAL_CHARS, contextChars = 160, regexTimeoutMs = DEFAULT_REGEX_TIMEOUT, maxCandidateFiles = DEFAULT_MAX_CANDIDATE_FILES, traversalTimeoutMs = DEFAULT_TRAVERSAL_TIMEOUT, searchTimeoutMs = DEFAULT_SEARCH_TIMEOUT, pageToken, allowExternal = false, excludes = [".git", ".deepseek-watch", "node_modules", "dist", "build", "out", ".next", ".cache", "coverage"] }) {
   const root = resolve(cwd);
   const requested = isAbsolute(String(path)) ? resolve(String(path)) : resolve(root, String(path || "."));
   if (!allowExternal && !isAbsolutePathInside(root, requested)) throw new Error("Path escapes workspace; use full permission for explicit external paths.");
+  if (isFilesystemRoot(requested)) throw new Error("Refusing to recursively search a filesystem root. Change to a project directory or an explicit file/subdirectory.");
   const max = Math.min(Math.max(Number(maxMatches) || DEFAULT_MAX_MATCHES, 1), MAX_MATCHES);
   const resultCap = Math.min(Math.max(Number(maxResultChars) || DEFAULT_RESULT_CHARS, 80), 10000);
   const totalCap = Math.min(Math.max(Number(maxTotalChars) || DEFAULT_TOTAL_CHARS, resultCap), 200000);
   const offset = pageToken ? untoken(pageToken).offset || 0 : 0;
-  const files = await collectFiles(root, requested, glob ? globToRegex(glob) : null, new Set(excludes));
+  const traversal = await collectFiles(root, requested, glob ? globToRegex(glob) : null, new Set(excludes), {
+    maxFiles: Math.min(Math.max(Number(maxCandidateFiles) || DEFAULT_MAX_CANDIDATE_FILES, 1), 20000),
+    timeoutMs: Math.min(Math.max(Number(traversalTimeoutMs) || DEFAULT_TRAVERSAL_TIMEOUT, 100), 30000)
+  });
+  const files = traversal.files;
+  const searchDeadline = Date.now() + Math.min(Math.max(Number(searchTimeoutMs) || DEFAULT_SEARCH_TIMEOUT, 250), 60000);
   const regex = (() => { try { new RegExp(pattern, ignoreCase ? "i" : ""); return true; } catch { return false; } })();
   const matches = []; let scanned = 0; let skipped = 0; let timedOut = false; let consumed = 0; let hitCap = false; let totalChars = 0;
   for (const file of files) {
+    if (Date.now() >= searchDeadline) { timedOut = true; break; }
     if (matches.length >= max || consumed >= totalCap) break;
     let buffer; try { buffer = await readFile(file.absPath); } catch { skipped += 1; continue; }
     if (buffer.length > MAX_FILE_BYTES || isLikelyBinary(buffer)) { skipped += 1; continue; }
@@ -118,7 +145,7 @@ export async function boundedSearch({ cwd = process.cwd(), taskId, pattern, path
     let found;
     try {
       found = regex
-        ? await regexMatches(text, pattern, ignoreCase ? "gi" : "g", max - matches.length + offset, regexTimeoutMs)
+        ? await regexMatches(text, pattern, ignoreCase ? "gi" : "g", max - matches.length + offset, Math.min(regexTimeoutMs, Math.max(searchDeadline - Date.now(), 25)))
         : literalMatches(text, pattern, ignoreCase, max - matches.length + offset);
     } catch (error) { if (error.code === "REGEX_TIMEOUT") { timedOut = true; break; } throw error; }
     for (const item of found) {
@@ -136,9 +163,9 @@ export async function boundedSearch({ cwd = process.cwd(), taskId, pattern, path
     if (found.length >= max - matches.length + offset || hitCap) { hitCap = true; break; }
   }
   const more = hitCap || timedOut;
-  const raw = JSON.stringify({ pattern, matches, scanned_files: scanned, skipped_files: skipped, timed_out: timedOut, result_cap: resultCap, total_cap: totalCap }, null, 2);
-  const artifact = await writeArtifact({ cwd, taskId, kind: "search", name: "search-results.json", data: raw, metadata: { pattern, matches: matches.length, timed_out: timedOut } });
-  return { matches, scanned_files: scanned, skipped_files: skipped, timed_out: timedOut, artifact, next_page_token: more ? token({ offset: offset + matches.length, pattern, path }) : null };
+  const raw = JSON.stringify({ pattern, matches, scanned_files: scanned, skipped_files: skipped, timed_out: timedOut, traversal_truncated: traversal.truncated, traversal_reason: traversal.reason, visited_entries: traversal.visitedEntries, result_cap: resultCap, total_cap: totalCap }, null, 2);
+  const artifact = await writeArtifact({ cwd, taskId, kind: "search", name: "search-results.json", data: raw, metadata: { pattern, matches: matches.length, timed_out: timedOut, traversal_truncated: traversal.truncated } });
+  return { matches, scanned_files: scanned, skipped_files: skipped, timed_out: timedOut, traversal_truncated: traversal.truncated, traversal_reason: traversal.reason, visited_entries: traversal.visitedEntries, artifact, next_page_token: more ? token({ offset: offset + matches.length, pattern, path }) : null };
 }
 
 function isAbsolutePathInside(root, target) {

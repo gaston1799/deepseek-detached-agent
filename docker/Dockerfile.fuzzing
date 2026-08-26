@@ -1,5 +1,8 @@
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends afl++ bash ca-certificates clang file git llvm python3 ripgrep && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends afl++ bash ca-certificates clang file git llvm python3 ripgrep gdb binutils && rm -rf /var/lib/apt/lists/*
+# NOTE: for ASAN-backed builds (fz_prepare asan:true) and libFuzzer, install the
+# sanitizer runtime too (requires network at build time):
+#   apt-get install -y libclang-rt-18-dev
 WORKDIR /workspace
 CMD ["sleep", "infinity"]

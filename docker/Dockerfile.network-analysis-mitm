@@ -1,0 +1,11 @@
+# Optional mitmproxy-enabled network-analysis image.
+# Build with:
+#   docker build --file docker/Dockerfile.network-analysis-mitm --tag dsw/network-analysis-mitm:latest .
+# Then point SANDBOX_ENVIRONMENTS["network-analysis"].image at dsw/network-analysis-mitm:latest
+# in src/sandbox.js.
+FROM dsw/network-analysis:latest
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends curl python3-pip && rm -rf /var/lib/apt/lists/* \
+  && pip3 install --no-cache-dir mitmproxy
+WORKDIR /workspace
+CMD ["sleep", "infinity"]

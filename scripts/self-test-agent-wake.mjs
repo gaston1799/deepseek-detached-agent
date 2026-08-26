@@ -16,6 +16,7 @@ let coordinator;
 let child;
 let requestCount = 0;
 let secondRequestMessages = [];
+let thirdRequestMessages = [];
 
 function sse(response, payloads) {
   response.writeHead(200, { "Content-Type": "text/event-stream" });
@@ -44,8 +45,13 @@ const server = createServer(async (request, response) => {
     }]);
     return;
   }
-  secondRequestMessages = parsed.messages || [];
-  sse(response, [{ choices: [{ delta: { content: "Woke after coordinator message." }, finish_reason: "stop" }] }]);
+  if (requestCount === 2) {
+    secondRequestMessages = parsed.messages || [];
+    sse(response, [{ choices: [{ delta: { content: "Woke after coordinator message." }, finish_reason: "stop" }] }]);
+    return;
+  }
+  thirdRequestMessages = parsed.messages || [];
+  sse(response, [{ choices: [{ delta: { content: "Resumed after normal completion." }, finish_reason: "stop" }] }]);
 });
 
 async function waitUntil(predicate, timeoutMs, label) {
@@ -124,6 +130,28 @@ try {
   assert.equal(savedSession.config.agentRole, "worker");
   assert.equal(savedSession.messages[0].role, "system");
   assert.match(savedSession.messages[0].content, /agent_id: worker-test/);
+
+  const sender = spawn(process.execPath, [
+    join(repoRoot, "src", "deepseek-watch.js"),
+    "message", "worker-test", "A new instruction after normal completion.",
+    "--coord-dir", coordDir
+  ], {
+    cwd: tempRoot,
+    env: { ...process.env, DEEPSEEK_API_KEY: "test-key" },
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  const senderExit = await new Promise((resolvePromise, reject) => {
+    sender.once("error", reject);
+    sender.once("exit", (code) => resolvePromise(code));
+  });
+  assert.equal(senderExit, 0, "message command should queue and auto-resume a completed agent");
+  await waitUntil(() => requestCount === 3, 8000, "completed worker to auto-resume after a message");
+  assert.equal(
+    thirdRequestMessages.some((message) => message.role === "user" && String(message.content).includes('<agent_message from="operator" type="message"')),
+    true,
+    "message to a completed agent should be injected into the automatically resumed session"
+  );
   process.stdout.write("agent park/wake end-to-end self-test: ok\n");
 } finally {
   if (child && child.exitCode == null) child.kill();

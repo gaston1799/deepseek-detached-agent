@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, parse } from "node:path";
 import { boundedSearch } from "../src/search.js";
 import { readArtifactRange, searchArtifact } from "../src/artifacts.js";
 
@@ -25,6 +25,15 @@ try {
   const bundle = await boundedSearch({ cwd: root, taskId: "test", pattern: "needle", path: "bundle.js", maxMatches: 2, contextChars: 10 });
   assert.equal(bundle.matches[0].minified, true);
   assert.ok(bundle.matches[0].snippet.length < 100);
+
+  const traversal = await boundedSearch({ cwd: root, taskId: "test", pattern: "needle", path: ".", maxMatches: 2, maxCandidateFiles: 1 });
+  assert.equal(traversal.traversal_truncated, true);
+  assert.equal(traversal.traversal_reason, "candidate_file_limit");
+
+  await assert.rejects(
+    () => boundedSearch({ cwd: parse(root).root, taskId: "test", pattern: "needle", path: "." }),
+    /filesystem root/
+  );
 
   const range = await readArtifactRange({ cwd: root, taskId: "test", artifact: first.artifact.id, maxBytes: 100 });
   assert.ok(range.content.includes("matches"));

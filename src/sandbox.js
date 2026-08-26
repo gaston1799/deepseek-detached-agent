@@ -1,5 +1,5 @@
-import { createWriteStream } from "node:fs";
-import { spawn } from "node:child_process";
+import { createWriteStream, existsSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { registerArtifactFile, taskRoot } from "./artifacts.js";
@@ -16,6 +16,33 @@ export const SANDBOX_ENVIRONMENTS = {
 const MAX_PREVIEW = 12000;
 const MAX_TOTAL = 24000;
 let cachedDockerCpuLimit = null;
+let cachedDockerBin = null;
+
+// On Windows, PATH usually contains both an extensionless `docker` (a bash
+// script) and `docker.exe`. Node's spawn() may pick the script and fail with
+// `spawn UNKNOWN` (errno -4094). Resolve the real .exe explicitly.
+function dockerExecutable() {
+  if (cachedDockerBin) return cachedDockerBin;
+  if (process.platform !== "win32") { cachedDockerBin = "docker"; return cachedDockerBin; }
+  const candidates = [
+    "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe",
+    "C:\\Program Files\\Docker\\Docker\\resources\\cli-plugins\\docker.exe",
+    process.env["ProgramFiles"] ? `${process.env["ProgramFiles"]}\\Docker\\Docker\\resources\\bin\\docker.exe` : null,
+  ].filter(Boolean);
+  for (const c of candidates) {
+    if (existsSync(c)) { cachedDockerBin = c; return cachedDockerBin; }
+  }
+  // Fall back to PATH resolution via where.exe.
+  try {
+    const res = spawnSync("where.exe", ["docker.exe"], { encoding: "utf8", windowsHide: true });
+    if (res.status === 0 && res.stdout) {
+      const first = String(res.stdout).split(/\r?\n/).map((s) => s.trim()).find((s) => /docker\.exe$/i.test(s) && s.length);
+      if (first) { cachedDockerBin = first; return cachedDockerBin; }
+    }
+  } catch { /* keep default */ }
+  cachedDockerBin = "docker.exe";
+  return cachedDockerBin;
+}
 
 function profile(name) {
   const value = String(name || "linux-general");
@@ -30,7 +57,8 @@ function cap(value, max = MAX_PREVIEW) {
 
 function docker(args, { timeoutMs = 120000, input = "", outputDir, outputPrefix = "docker" } = {}) {
   return new Promise((resolvePromise, reject) => {
-    const child = spawn("docker", args, { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+    const dockerBin = dockerExecutable();
+    const child = spawn(dockerBin, args, { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = ""; let stderr = ""; let stdoutChars = 0; let stderrChars = 0; let settled = false;
     const stdoutFile = outputDir ? join(outputDir, `${outputPrefix}.stdout.log`) : null;
     const stderrFile = outputDir ? join(outputDir, `${outputPrefix}.stderr.log`) : null;

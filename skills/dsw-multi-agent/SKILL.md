@@ -20,6 +20,8 @@ Every dsw session has an `agent_id`, even when `--agent-id` is omitted. Use:
 
 Messages to a working agent queue until a safe turn boundary. Messages to an agent parked with `agent_wait` wake the wrapper and resume the same saved session. The sender appears inside an `<agent_message from="...">` block; API message roles remain standard.
 
+Messages (`message`, `handoff`, or `wake`) sent to an agent that ended normally with state `completed` automatically start that agent's saved session headlessly and deliver the inbox message. This is not applied to `failed` agents, which remain stopped for diagnosis; use an explicit resume after fixing the failure.
+
 Do not edit a scope claimed by another agent unless it explicitly hands the task off. Use separate Git worktrees for agents that write source files. All agents in separate worktrees must receive the same absolute `--coord-dir`.
 
 ## Resuming agents and sessions

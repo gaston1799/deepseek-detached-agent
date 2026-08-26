@@ -1,0 +1,10 @@
+# Optional Frida-enabled linux-re image.
+# Build with:
+#   docker build --file docker/Dockerfile.linux-re-frida --tag dsw/linux-re-frida:latest .
+# Then point SANDBOX_ENVIRONMENTS["linux-re"].image at dsw/linux-re-frida:latest
+# in src/sandbox.js.
+FROM dsw/linux-re:latest
+ENV DEBIAN_FRONTEND=noninteractive
+RUN pip3 install --no-cache-dir frida frida-tools
+WORKDIR /workspace
+CMD ["sleep", "infinity"]

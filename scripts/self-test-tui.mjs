@@ -1,7 +1,7 @@
 // Self-test for src/tui.js rendering logic (markdown writer, status line
 // helpers, tool tracker). Pure-logic checks; no real TTY required.
 import assert from "node:assert";
-import { createMarkdownWriter, formatDuration, renderMarkdownLine, ToolCallTracker } from "../src/tui.js";
+import { createMarkdownWriter, fitTerminalLine, formatDuration, renderMarkdownLine, ToolCallTracker } from "../src/tui.js";
 
 let passed = 0;
 function check(name, fn) {
@@ -19,6 +19,12 @@ check("formatDuration", () => {
   assert.equal(formatDuration(1500), "1.5s");
   assert.equal(formatDuration(90000), "1m 30s");
   assert.equal(formatDuration(0), "0ms");
+});
+
+check("status line leaves a soft-wrap safety margin", () => {
+  const line = fitTerminalLine("x".repeat(80), 40);
+  assert.equal([...line].length, 37);
+  assert.ok(line.endsWith("…"));
 });
 
 // renderMarkdownLine: color-off is a plain passthrough.

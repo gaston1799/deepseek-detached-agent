@@ -1,15 +1,25 @@
 import { readFile, readdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { getArtifact, registerArtifactFile, taskRoot } from "./artifacts.js";
 import { sandboxExecute } from "./sandbox.js";
 import { sandboxOperation } from "./sandbox.js";
 
 function quote(value) { return `'${String(value).replaceAll("'", "'\\''")}'`; }
 
+// Convert a workspace-relative artifact path (relative to cwd) into the path
+// the container sees: the sandbox mounts the task root at /workspace.
+function containerPath(cwd, taskId, recordPath) {
+  const absolute = resolve(cwd, recordPath);
+  const root = taskRoot(cwd, taskId);
+  const rel = relative(root, absolute).replaceAll("\\", "/");
+  return rel.startsWith("..") ? null : `/workspace/${rel}`;
+}
+
 async function pcapCommand({ cwd, taskId, artifact, command }) {
   const found = await getArtifact({ cwd, taskId, artifact });
-  const relativeArtifact = found.record.path.replaceAll("\\", "/");
-  const fullCommand = `tshark -r ${quote(`/workspace/${relativeArtifact}`)} ${command}`;
+  const inContainer = containerPath(cwd, taskId, found.record.path);
+  if (!inContainer) throw new Error(`Artifact is outside the sandbox task workspace: ${found.record.path}`);
+  const fullCommand = `tshark -r ${quote(inContainer)} ${command}`;
   return sandboxExecute({ cwd, taskId, environment: "network-analysis", command: fullCommand, timeoutMs: 120000, networkPolicy: "none" });
 }
 

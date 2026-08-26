@@ -24,6 +24,17 @@ export function formatDuration(ms) {
   return `${Math.floor(value / 60000)}m ${Math.round((value % 60000) / 1000)}s`;
 }
 
+// A status line is cleared and redrawn in place. Never let it reach the final
+// terminal column: terminals can soft-wrap there, while ANSI clearLine() only
+// clears the current physical row. Leave a small margin and add an ellipsis.
+export function fitTerminalLine(text, columns = process.stdout.columns || 120, margin = 3) {
+  const max = Math.max(Number(columns || 120) - Math.max(Number(margin) || 0, 1), 1);
+  const chars = [...String(text ?? "")];
+  if (chars.length <= max) return chars.join("");
+  if (max === 1) return "…";
+  return `${chars.slice(0, max - 1).join("")}…`;
+}
+
 // ── Streaming markdown-lite writer ──────────────────────────────────────────
 // Buffers partial lines so only complete lines get styled; fences span writes.
 // `linkify` (optional) post-processes a fully styled line (e.g. file links).
@@ -265,9 +276,10 @@ export function createStatusLine(opts, phrase = "Working", initialTokens = 0, mo
     const elapsed = formatDuration(Date.now() - started);
     const parts = [spinner, currentPhrase, `${tokens} tok`, elapsed];
     if (modelLabel) parts.splice(1, 0, modelLabel);
+    const text = fitTerminalLine(`  ${parts.join(" · ")}`);
     clearLine(process.stdout, 0);
     cursorTo(process.stdout, 0);
-    process.stdout.write(dim(opts, `  ${parts.join(" · ")}`));
+    process.stdout.write(dim(opts, text));
     visible = true;
   };
 

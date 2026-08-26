@@ -1,0 +1,14 @@
+# Optional Ghidra-enabled linux-re image (large download, ~1.5GB).
+# Build with:
+#   docker build --file docker/Dockerfile.linux-re-ghidra --tag dsw/linux-re-ghidra:latest .
+# Then point SANDBOX_ENVIRONMENTS["linux-re"].image at dsw/linux-re-ghidra:latest
+# in src/sandbox.js (or swap the tag) and re-run `dsw security allow <domain>`.
+FROM dsw/linux-re:latest
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends openjdk-17-jre-headless wget && rm -rf /var/lib/apt/lists/*
+RUN wget -q https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.1.2_build/ghidra_11.1.2_PUBLIC_20240709.zip -O /tmp/ghidra.zip \
+  && unzip -q /tmp/ghidra.zip -d /opt \
+  && rm /tmp/ghidra.zip \
+  && ln -sf /opt/ghidra_11.1.2_PUBLIC/support/analyzeHeadless /usr/local/bin/analyzeHeadless
+WORKDIR /workspace
+CMD ["sleep", "infinity"]
