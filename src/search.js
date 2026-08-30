@@ -13,6 +13,9 @@ const MAX_FILE_BYTES = 100 * 1024 * 1024;
 const DEFAULT_MAX_CANDIDATE_FILES = 5000;
 const DEFAULT_TRAVERSAL_TIMEOUT = 3000;
 const DEFAULT_SEARCH_TIMEOUT = 10000;
+const MAX_BEAUTIFIED_LINE_LENGTH = 240;
+const MAX_BEAUTIFY_BYTES = 5 * 1024 * 1024;
+const SOURCE_EXTENSIONS = /\.(?:(?:c|m)?js|jsx?|tsx?|css|scss|less|vue|svelte|html?|xml)$/i;
 
 function globToRegex(pattern) {
   let out = "";
@@ -40,6 +43,124 @@ function fileSignals(text, bytes) {
   const maxLine = lines.reduce((max, line) => Math.max(max, line.length), 0);
   const average = bytes / Math.max(lines.length, 1);
   return { line_count: lines.length, max_line_length: maxLine, average_line_length: Math.round(average), minified: maxLine > 10000 || average > 1000 || (bytes > 200000 && lines.length < 100) };
+}
+
+function appendIndent(output, indent) {
+  if (output.length === 0 || output.at(-1) === "\n") output.push("  ".repeat(Math.max(indent, 0)));
+}
+
+function trimTrailingWhitespace(output) {
+  while (output.length && /\s$/.test(output.at(-1)) && output.at(-1) !== "\n") output.pop();
+}
+
+function newline(output, indent) {
+  trimTrailingWhitespace(output);
+  if (output.at(-1) !== "\n") output.push("\n");
+  appendIndent(output, indent);
+}
+
+// This is deliberately a conservative formatter for search context, not a source formatter.
+// It only adds boundaries outside strings/comments so bundled lines cannot consume the model context.
+function beautifySourceForSearch(text) {
+  const output = [];
+  let indent = 0;
+  let quote = null;
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+  let parenDepth = 0;
+
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    const next = text[i + 1];
+
+    if (quote) {
+      appendIndent(output, indent);
+      output.push(ch);
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (lineComment) {
+      output.push(ch);
+      if (ch === "\n") { lineComment = false; appendIndent(output, indent); }
+      continue;
+    }
+    if (blockComment) {
+      output.push(ch);
+      if (ch === "*" && next === "/") { output.push(next); i += 1; blockComment = false; newline(output, indent); }
+      continue;
+    }
+    if ((ch === "'" || ch === '"' || ch === "`") && !quote) {
+      appendIndent(output, indent);
+      output.push(ch);
+      quote = ch;
+      continue;
+    }
+    if (ch === "/" && next === "/") {
+      appendIndent(output, indent);
+      output.push(ch, next);
+      i += 1;
+      lineComment = true;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      appendIndent(output, indent);
+      output.push(ch, next);
+      i += 1;
+      blockComment = true;
+      continue;
+    }
+    if (ch === "(") parenDepth += 1;
+    if (ch === ")") parenDepth = Math.max(0, parenDepth - 1);
+    if (ch === "{") {
+      trimTrailingWhitespace(output);
+      output.push(" {");
+      indent += 1;
+      newline(output, indent);
+    } else if (ch === "}") {
+      indent = Math.max(0, indent - 1);
+      newline(output, indent);
+      output.push("}");
+      if (next !== ";" && next !== "," && next !== ")" && next !== "]") newline(output, indent);
+    } else if (ch === ";" && parenDepth === 0) {
+      output.push(";");
+      newline(output, indent);
+    } else if (ch === "\n") {
+      newline(output, indent);
+    } else if (/\s/.test(ch)) {
+      if (output.length && output.at(-1) !== " " && output.at(-1) !== "\n") output.push(" ");
+    } else {
+      appendIndent(output, indent);
+      output.push(ch);
+    }
+  }
+
+  trimTrailingWhitespace(output);
+  return output.join("").trim();
+}
+
+function wrapLongLinesForSearch(text) {
+  return text.split("\n").flatMap((line) => {
+    if (line.length <= MAX_BEAUTIFIED_LINE_LENGTH) return [line];
+    const chunks = [];
+    for (let offset = 0; offset < line.length; offset += MAX_BEAUTIFIED_LINE_LENGTH) {
+      chunks.push(line.slice(offset, offset + MAX_BEAUTIFIED_LINE_LENGTH));
+    }
+    return chunks;
+  }).join("\n");
+}
+
+function searchView(text, relPath, signals, bytes) {
+  if (!signals.minified) return { text, mode: "source" };
+  if (bytes > MAX_BEAUTIFY_BYTES) return { text, mode: "bounded" };
+  if (/\.json$/i.test(relPath)) {
+    try { return { text: JSON.stringify(JSON.parse(text), null, 2), mode: "beautified" }; }
+    catch { /* Fall through to the source formatter for JSON-like bundles. */ }
+  }
+  if (SOURCE_EXTENSIONS.test(relPath)) return { text: beautifySourceForSearch(text), mode: "beautified" };
+  return { text: wrapLongLinesForSearch(text), mode: "wrapped" };
 }
 
 function lineColumn(text, offset) {
@@ -135,26 +256,28 @@ export async function boundedSearch({ cwd = process.cwd(), taskId, pattern, path
   const files = traversal.files;
   const searchDeadline = Date.now() + Math.min(Math.max(Number(searchTimeoutMs) || DEFAULT_SEARCH_TIMEOUT, 250), 60000);
   const regex = (() => { try { new RegExp(pattern, ignoreCase ? "i" : ""); return true; } catch { return false; } })();
-  const matches = []; let scanned = 0; let skipped = 0; let timedOut = false; let consumed = 0; let hitCap = false; let totalChars = 0;
+  const matches = []; let scanned = 0; let skipped = 0; let timedOut = false; let consumed = 0; let hitCap = false; let totalChars = 0; let beautifiedFiles = 0;
   for (const file of files) {
     if (Date.now() >= searchDeadline) { timedOut = true; break; }
     if (matches.length >= max || consumed >= totalCap) break;
     let buffer; try { buffer = await readFile(file.absPath); } catch { skipped += 1; continue; }
     if (buffer.length > MAX_FILE_BYTES || isLikelyBinary(buffer)) { skipped += 1; continue; }
-    const text = buffer.toString("utf8"); const signals = fileSignals(text, buffer.length); scanned += 1;
+    const text = buffer.toString("utf8"); const signals = fileSignals(text, buffer.length); const view = searchView(text, file.relPath, signals, buffer.length); scanned += 1;
+    if (view.mode === "beautified") beautifiedFiles += 1;
+    const searchableText = view.text;
     let found;
     try {
       found = regex
-        ? await regexMatches(text, pattern, ignoreCase ? "gi" : "g", max - matches.length + offset, Math.min(regexTimeoutMs, Math.max(searchDeadline - Date.now(), 25)))
-        : literalMatches(text, pattern, ignoreCase, max - matches.length + offset);
+        ? await regexMatches(searchableText, pattern, ignoreCase ? "gi" : "g", max - matches.length + offset, Math.min(regexTimeoutMs, Math.max(searchDeadline - Date.now(), 25)))
+        : literalMatches(searchableText, pattern, ignoreCase, max - matches.length + offset);
     } catch (error) { if (error.code === "REGEX_TIMEOUT") { timedOut = true; break; } throw error; }
     for (const item of found) {
       if (consumed < offset) { consumed += 1; continue; }
-      const location = lineColumn(text, item.index);
-      const start = Math.max(0, item.index - contextChars); const end = Math.min(text.length, item.index + item.text.length + contextChars);
-      const rawSnippet = text.slice(start, end).replace(/\r?\n/g, "\\n");
+      const location = lineColumn(searchableText, item.index);
+      const start = Math.max(0, item.index - contextChars); const end = Math.min(searchableText.length, item.index + item.text.length + contextChars);
+      const rawSnippet = searchableText.slice(start, end).replace(/\r?\n/g, "\\n");
       const snippet = rawSnippet.length > resultCap ? rawSnippet.slice(0, resultCap) + "…" : rawSnippet;
-      const entry = { path: file.relPath, match: item.text.slice(0, resultCap), character_offset: item.index, byte_offset: Buffer.byteLength(text.slice(0, item.index), "utf8"), line: location.line, column: location.column, snippet, minified: signals.minified };
+      const entry = { path: file.relPath, match: item.text.slice(0, resultCap), character_offset: item.index, byte_offset: Buffer.byteLength(searchableText.slice(0, item.index), "utf8"), line: location.line, column: location.column, snippet, minified: signals.minified, search_view: view.mode };
       const serialized = JSON.stringify(entry);
       if (totalChars + serialized.length > totalCap) { hitCap = true; break; }
       matches.push(entry); consumed += 1;
@@ -163,9 +286,9 @@ export async function boundedSearch({ cwd = process.cwd(), taskId, pattern, path
     if (found.length >= max - matches.length + offset || hitCap) { hitCap = true; break; }
   }
   const more = hitCap || timedOut;
-  const raw = JSON.stringify({ pattern, matches, scanned_files: scanned, skipped_files: skipped, timed_out: timedOut, traversal_truncated: traversal.truncated, traversal_reason: traversal.reason, visited_entries: traversal.visitedEntries, result_cap: resultCap, total_cap: totalCap }, null, 2);
+  const raw = JSON.stringify({ pattern, matches, scanned_files: scanned, skipped_files: skipped, beautified_files: beautifiedFiles, timed_out: timedOut, traversal_truncated: traversal.truncated, traversal_reason: traversal.reason, visited_entries: traversal.visitedEntries, result_cap: resultCap, total_cap: totalCap }, null, 2);
   const artifact = await writeArtifact({ cwd, taskId, kind: "search", name: "search-results.json", data: raw, metadata: { pattern, matches: matches.length, timed_out: timedOut, traversal_truncated: traversal.truncated } });
-  return { matches, scanned_files: scanned, skipped_files: skipped, timed_out: timedOut, traversal_truncated: traversal.truncated, traversal_reason: traversal.reason, visited_entries: traversal.visitedEntries, artifact, next_page_token: more ? token({ offset: offset + matches.length, pattern, path }) : null };
+  return { matches, scanned_files: scanned, skipped_files: skipped, beautified_files: beautifiedFiles, timed_out: timedOut, traversal_truncated: traversal.truncated, traversal_reason: traversal.reason, visited_entries: traversal.visitedEntries, artifact, next_page_token: more ? token({ offset: offset + matches.length, pattern, path }) : null };
 }
 
 function isAbsolutePathInside(root, target) {
