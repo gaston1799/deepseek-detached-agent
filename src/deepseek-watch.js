@@ -4968,6 +4968,48 @@ async function spawnSwarmAgent(opts, args, { resume }) {
   };
 }
 
+function selfLaunchArgs(args) {
+  // Source checkout: node src/deepseek-watch.js <args>.
+  // SEA executable: dsw.exe <args> (there is no script argument to repeat).
+  const entry = process.argv[1] ? resolve(process.argv[1]) : "";
+  return entry.endsWith("deepseek-watch.js") ? [entry, ...args] : args;
+}
+
+async function resumeAgentAfterMessage(opts, agentId) {
+  const records = await coordinationAgentRecords(opts);
+  const existing = records.find((agent) => agent.agentId === agentId);
+  if (!existing || existing.live || !existing.session) return null;
+
+  let session;
+  try {
+    session = JSON.parse(await readFile(existing.session, "utf8"));
+  } catch (error) {
+    throw new Error(`Cannot auto-resume agent '${agentId}': ${error.message}`);
+  }
+  const config = session.config || {};
+  const workerArgs = [
+    "--resume",
+    "--session", existing.session,
+    "--agent-id", agentId,
+    "--agent-role", existing.role || config.agentRole || "worker",
+    "--coord-dir", existing.coordinationRoot || opts.coordDir,
+    "--permission", config.permission || "full",
+    "-p", "Resume after receiving a coordination message. Inspect the inbox and continue the current mission."
+  ];
+  const coordinatorId = config.coordinatorId || existing.coordinatorId;
+  if (coordinatorId) workerArgs.push("--coordinator-id", coordinatorId);
+  if (existing.mission) workerArgs.push("--agent-mission", existing.mission);
+
+  const child = spawn(process.execPath, selfLaunchArgs(workerArgs), {
+    cwd: existing.workspace || process.cwd(),
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true
+  });
+  child.unref();
+  return { resumed: true, pid: child.pid || null };
+}
+
 async function processAgentTurns(opts, session) {
   let emptyRecoveryAttempts = 0;
   for (let turn = 0; opts.maxToolTurns === null || turn <= opts.maxToolTurns; turn += 1) {
@@ -5438,7 +5480,9 @@ async function runCoordinationCommand(command, argv) {
       type: command === "wake" ? "wake" : (opts.type || "message"),
       taskId: opts.taskId
     });
+    const resumed = await resumeAgentAfterMessage(opts, to);
     process.stdout.write(`Queued ${message.type} ${message.id} from ${message.from} to ${message.to}.\n`);
+    if (resumed) process.stdout.write(`Auto-resumed ${to} (PID ${resumed.pid || "starting"}).\n`);
     return;
   }
   if (command === "inbox") {
